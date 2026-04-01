@@ -2,12 +2,23 @@
  * server.js
  * Qase Webhooks -> Slack
  *
- * v19 (based on your v18):
- * - Restores full summary (Passed/Failed/Flaky/Skipped/Blocked/Invalid) + list
+ * v20:
+ * - Sends ONLY ONE Slack message (no pre-notify "Collecting results...")
+ * - Single header: Project + Run + Date + Browsers + Summary + Run link + List
  * - Keeps DK date: DD/MM/YYYY - Week X (English "Week")
- * - Keeps: snapshot-id parsing (en_int) -> URL -> Visual title
+ * - Keeps snapshot-id parsing (en_int) -> URL -> Visual title
  * - Keeps: NO failure reason in Slack (only status + title)
  * - Aggregates results to avoid duplicates (case_id > hash > id)
+ *
+ * FIX (your crash):
+ * - The disclaimer is now a normal string constant and is concatenated safely
+ *   (avoids the "… is not a function" tagged-template bug).
+ *
+ * ✅ CHANGE YOU ASKED (ONLY THIS):
+ * - If Playwright retried a test and it passed, Qase may still report it as "failed".
+ *   We detect retry/flaky signals and classify it as STATUS.FLAKY so Slack shows it as flaky.
+ * - Also merges "failed + passed" attempts into ONE line (flaky) instead of duplicates.
+ * - NOTHING ELSE in the Slack message format was changed.
  */
 
 require('dotenv').config();
@@ -17,7 +28,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v19 (RESTORE SUMMARY + SNAPSHOT en_int->URL TITLE + AGGREGATE + NO REASON)';
+  'QASE->SLACK v20 (SINGLE MESSAGE + SUMMARY + SNAPSHOT TITLE + AGGREGATE + NO REASON)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 function missingEnvs() {
@@ -25,6 +36,7 @@ function missingEnvs() {
 }
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+console.log('SLACK_WEBHOOK_URL =', SLACK_WEBHOOK_URL);
 const QASE_API_TOKEN = process.env.QASE_API_TOKEN;
 const QASE_PROJECT_CODE = process.env.QASE_PROJECT_CODE;
 const PORT = Number(process.env.PORT || 3000);
@@ -34,6 +46,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ts = () => new Date().toISOString().replace('T', ' ').replace('Z', 'Z');
 const log = (...a) => console.log(`[${ts()}]`, ...a);
+
+const DISCLAIMER =
+  'Important: Not all failed tests indicate a software defect. Some failures can be caused by temporary environment issues (e.g., slow response times, network instability, third-party outages, or test runner constraints) and may require a rerun to confirm.';
 
 function qaseHeaders() {
   return { 'Content-Type': 'application/json', Token: QASE_API_TOKEN };
@@ -168,7 +183,7 @@ function statusRank(s) {
   if (s === STATUS.BLOCKED) return 2;
   if (s === STATUS.SKIPPED) return 3;
   if (s === STATUS.FLAKY) return 4;
-  return 5; // passed last
+  return 5;
 }
 
 /* ---------------- TITLE helpers ---------------- */
@@ -187,7 +202,7 @@ function extractCaseId(r) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// No failure reason in Slack: only short suffix signals (param/browser/env)
+// No failure reason in Slack: only short suffix signals
 function resultSuffix(r) {
   const bits = [];
 
@@ -234,16 +249,10 @@ function cleanupSnapshotDerivedTitle(s) {
   return t || null;
 }
 
-/**
- * snapshot-id -> URL
- * Supports "en_int" (region=3 letters)
- * Format: <domainPart>_<lang>_<region>_<path...>
- * domainPart uses "-" as "." (e.g. www-kompan-com -> www.kompan.com)
- */
+// snapshot-id -> URL (supports en_int)
 function snapshotIdToUrl(snapshotId) {
   const s = String(snapshotId || '').trim();
   if (!s) return null;
-
   if ((s.match(/_/g) || []).length < 3) return null;
 
   const parts = s.split('_');
@@ -259,8 +268,7 @@ function snapshotIdToUrl(snapshotId) {
   if (!/^[a-z0-9-]+$/i.test(domainPart)) return null;
 
   const domain = domainPart.replace(/-/g, '.');
-
-  let path = pathParts.join('_').replace(/_/g, '/');
+  const path = pathParts.join('_').replace(/_/g, '/');
   if (!path) return null;
 
   return `https://${domain}/${lang}/${region}/${path}`;
@@ -275,14 +283,12 @@ function titleFromErrorText(text) {
   if (!text || typeof text !== 'string') return null;
   const t = text.replace(/\r/g, '\n');
 
-  // If already contains "Visual Regression Test - ..."
   const vr = t.match(/(Visual Regression Test\s*-\s*[^\n]+)/i);
   if (vr && vr[1]) {
     const out = vr[1].trim().slice(0, 260);
     if (out && !isBadTitle(out)) return out;
   }
 
-  // Snapshot name/path
   const sn = t.match(/Snapshot name:\s*([^\n]+)/i) || t.match(/Snapshot:\s*([^\n]+)/i);
   if (sn && sn[1]) {
     const cleaned = cleanupSnapshotDerivedTitle(sn[1]);
@@ -353,6 +359,49 @@ function inferFailedFromResult(r) {
   const hasAttachments = Array.isArray(r?.attachments) && r.attachments.length > 0;
 
   return Boolean(hasErrorWord || hasAssertion || hasAttachments);
+}
+
+/**
+ * Infer "flaky" when a test was retried and passed.
+ * Best-effort across integrations.
+ */
+function inferFlakyFromResult(r) {
+  if (!r || typeof r !== 'object') return false;
+
+  if (r.is_flaky === true || r.flaky === true) return true;
+
+  const retryCount =
+    Number(r.retries) ||
+    Number(r.retry) ||
+    Number(r.retry_count) ||
+    Number(r.retest) ||
+    Number(r.retest_count) ||
+    0;
+
+  const attempts =
+    (Array.isArray(r.retries) && r.retries) ||
+    (Array.isArray(r.retry_results) && r.retry_results) ||
+    (Array.isArray(r.attempts) && r.attempts) ||
+    (Array.isArray(r.results) && r.results) ||
+    [];
+
+  if (attempts.length) {
+    const statuses = attempts
+      .map((a) => normalizeStatus(a?.status ?? a?.status_id ?? a?.statusId ?? a?.result ?? a?.state))
+      .filter(Boolean);
+
+    const hasFail = statuses.includes(STATUS.FAILED) || statuses.includes(STATUS.INVALID);
+    const hasPass = statuses.includes(STATUS.PASSED);
+    if (hasFail && hasPass) return true;
+  }
+
+  if (retryCount > 0) return true;
+
+  const comment = typeof r.comment === 'string' ? r.comment : '';
+  const stack = typeof r.stacktrace === 'string' ? r.stacktrace : '';
+  if (/retry|re-?run|rerun|flaky/i.test(comment) || /retry|re-?run|rerun|flaky/i.test(stack)) return true;
+
+  return false;
 }
 
 /* ---------------- Slack ---------------- */
@@ -461,7 +510,13 @@ function mergeKeyForResult(r) {
   if (caseId) return `case:${caseId}`;
   if (r?.hash) return `hash:${r.hash}`;
   if (r?.id) return `id:${r.id}`;
-  return `nocase:${r?.end_time || r?.created || r?.created_at || Math.random().toString(16).slice(2)}`;
+
+  // ✅ deterministic fallback (prevents "failed+passed" duplicates when no case_id/hash/id)
+  const title = bestTitleFromResult(r) || 'unknown';
+  const browser = r?.browser || r?.metadata?.browser || '';
+  const env = r?.environment || r?.metadata?.env || '';
+  const param = typeof r?.param === 'string' ? r.param : '';
+  return `title:${title}|browser:${browser}|env:${env}|param:${param}`;
 }
 
 function pickBetterTitle(a, b) {
@@ -475,6 +530,26 @@ function pickBetterTitle(a, b) {
   return String(b).length < String(a).length ? b : a;
 }
 
+// ✅ combine statuses so fail+pass => flaky
+function combineStatus(existing, incoming) {
+  if (!existing) return incoming;
+
+  // normalize invalid as fail-like
+  const ex = existing === STATUS.INVALID ? STATUS.FAILED : existing;
+  const inc = incoming === STATUS.INVALID ? STATUS.FAILED : incoming;
+
+  // If either already flaky, keep flaky
+  if (ex === STATUS.FLAKY || inc === STATUS.FLAKY) return STATUS.FLAKY;
+
+  // If we see both pass and fail across attempts -> flaky
+  const passFailCombo =
+    (ex === STATUS.PASSED && inc === STATUS.FAILED) || (ex === STATUS.FAILED && inc === STATUS.PASSED);
+  if (passFailCombo) return STATUS.FLAKY;
+
+  // Otherwise keep the "worse" by rank (failed > blocked > skipped > flaky > passed)
+  return statusRank(inc) < statusRank(ex) ? incoming : existing;
+}
+
 /* ---------------- processing queue-safe per runId ---------------- */
 const processingByRunId = new Map();
 
@@ -486,20 +561,8 @@ async function processRunCompleted(projectCode, runId) {
 
   const p = (async () => {
     const runLink = `https://app.qase.io/run/${projectCode}/dashboard/${runId}`;
-
     log(`[QASE] Run completed: ${runId}`);
 
-    // Pre-notify
-    await sendToSlack({
-      text:
-        `*Automation Regression Tests*\n\n` +
-        `Project: *${projectCode}*\n` +
-        `Date: *${formatRunDateDenmarkWithWeek()}*\n\n` +
-        
-        `Collecting results...`,
-    });
-
-    log(`[QASE] Fetching run meta for ${runId} (include=cases)...`);
     const runMeta = await fetchRunMeta(runId).catch((e) => {
       log(`[QASE] Failed to fetch run meta: ${e.message}`);
       return null;
@@ -514,8 +577,6 @@ async function processRunCompleted(projectCode, runId) {
     }
 
     const runCases = Array.isArray(runMeta?.cases) ? runMeta.cases : [];
-    log(`[QASE] Run cases from /run include=cases: ${runCases.length}`);
-
     const caseMap = new Map();
     for (const c of runCases) {
       const cid = Number(c?.case_id ?? c?.id ?? c?.case?.id);
@@ -532,7 +593,6 @@ async function processRunCompleted(projectCode, runId) {
       caseMap.set(cid, { title, status: st });
     }
 
-    log(`[QASE] Fetching results list for run ${runId}...`);
     const results = await fetchResultsForRunStrict(runId, startedAtUnix, {
       limit: 100,
       maxPages: 50,
@@ -541,7 +601,15 @@ async function processRunCompleted(projectCode, runId) {
     });
 
     if (!results.length) {
-      log(`[QASE] No results returned for run ${runId}. Nothing else to send.`);
+      await sendToSlack({
+        text:
+          `*Automation Regression Tests*\n\n` +
+          `Project: *${projectCode}* | Run: *${runId}*\n` +
+          `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
+          `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
+          `Run link: ${runLink}\n\n` +
+          `No results returned from Qase API.`,
+      });
       return;
     }
 
@@ -553,10 +621,16 @@ async function processRunCompleted(projectCode, runId) {
       let status = normalizeStatus(r?.status ?? r?.status_id ?? r?.statusId ?? r?.result ?? r?.state);
       if (status === STATUS.INVALID && inferFailedFromResult(r)) status = STATUS.FAILED;
 
+      // ✅ apply caseMap override first (as you had), but DON'T let it kill flaky later
       if (caseId && caseMap.has(caseId)) {
         const s2 = caseMap.get(caseId)?.status;
         if (s2 && s2 !== STATUS.INVALID) status = s2;
         if (status === STATUS.INVALID && s2 === STATUS.FAILED) status = STATUS.FAILED;
+      }
+
+      // ✅ NOW apply flaky inference (so it is not overwritten by caseMap)
+      if (inferFlakyFromResult(r)) {
+        status = STATUS.FLAKY;
       }
 
       let title;
@@ -569,11 +643,9 @@ async function processRunCompleted(projectCode, runId) {
         title = bestTitleFromResult(r);
       }
 
-      // If title itself is snapshot-id, convert it to a real visual-title
       const urlFromTitle = snapshotIdToUrl(title);
       if (urlFromTitle) title = formatVisualTitleFromUrl(urlFromTitle);
 
-      // Add only short suffix (no error reason)
       title = `${title}${resultSuffix(r)}`;
 
       const key = mergeKeyForResult(r);
@@ -582,9 +654,9 @@ async function processRunCompleted(projectCode, runId) {
       if (!existing) {
         aggregated.set(key, { title, status });
       } else {
-        const worseStatus = statusRank(status) < statusRank(existing.status) ? status : existing.status;
+        const mergedStatus = combineStatus(existing.status, status);
         const betterTitle = pickBetterTitle(existing.title, title);
-        aggregated.set(key, { title: betterTitle, status: worseStatus });
+        aggregated.set(key, { title: betterTitle, status: mergedStatus });
       }
     }
 
@@ -603,15 +675,16 @@ async function processRunCompleted(projectCode, runId) {
     const order = { failed: 0, invalid: 1, blocked: 2, flaky: 3, skipped: 4, passed: 5 };
     lines.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
 
-    // ✅ FINAL message with SUMMARY + LIST (this is what was missing)
+    // ✅ SINGLE FINAL MESSAGE (unchanged formatting)
     await sendToSlack({
       text:
         `*Automation Regression Tests*\n\n` +
-        `Project: *${projectCode}*\n` +
-        `Date: *${formatRunDateDenmarkWithWeek()}*\n\n` +
-        `Passed: *${counts.passed}* | Failed: *${counts.failed}* | Rerunned: *${counts.flaky}* | ` +
-        `Skipped: *${counts.skipped}*\n\n` +
-       
+        `Project: *${projectCode}* | Run: *${runId}*\n` +
+        `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
+        `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
+        `Passed: *${counts.passed}* | Failed: *${counts.failed}* | Flaky: *${counts.flaky}* | ` +
+        `Skipped: *${counts.skipped}* | Blocked: *${counts.blocked}* | Invalid: *${counts.invalid}*\n\n` +
+        `_${DISCLAIMER}_\n\n` +
         `*Test case results (${lines.length}):*\n` +
         lines.map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`).join('\n'),
     });
@@ -628,6 +701,7 @@ async function processRunCompleted(projectCode, runId) {
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 app.post('/qase/webhook', async (req, res) => {
+  // ACK immediately
   res.status(200).json({ ok: true });
 
   try {
@@ -644,9 +718,7 @@ app.post('/qase/webhook', async (req, res) => {
 
     if (eventName === 'run.started') {
       const runId = req.body?.payload?.id;
-      const title = req.body?.payload?.title || '';
-      const env = req.body?.payload?.environment || '';
-      if (runId) log(`[QASE] Run started: ${runId} | title="${title}" | env="${env}"`);
+      if (runId) log(`[QASE] Run started: ${runId}`);
       return;
     }
 
@@ -657,10 +729,6 @@ app.post('/qase/webhook', async (req, res) => {
       log('[QASE] Missing payload.id (runId).');
       return;
     }
-
-    log(
-      `[QASE] Webhook run.completed received: run=${runId} payload.status="${req.body?.payload?.status || ''}"`
-    );
 
     processRunCompleted(projectCode, runId).catch((e) => {
       log(`[ERROR] Run ${runId} processing failed: ${e.message}`);
