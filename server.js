@@ -2,23 +2,10 @@
  * server.js
  * Qase Webhooks -> Slack
  *
- * v20:
- * - Sends ONLY ONE Slack message (no pre-notify "Collecting results...")
- * - Single header: Project + Run + Date + Browsers + Summary + Run link + List
- * - Keeps DK date: DD/MM/YYYY - Week X (English "Week")
- * - Keeps snapshot-id parsing (en_int) -> URL -> Visual title
- * - Keeps: NO failure reason in Slack (only status + title)
- * - Aggregates results to avoid duplicates (case_id > hash > id)
- *
- * FIX (your crash):
- * - The disclaimer is now a normal string constant and is concatenated safely
- *   (avoids the "… is not a function" tagged-template bug).
- *
- * ✅ CHANGE YOU ASKED (ONLY THIS):
- * - If Playwright retried a test and it passed, Qase may still report it as "failed".
- *   We detect retry/flaky signals and classify it as STATUS.FLAKY so Slack shows it as flaky.
- * - Also merges "failed + passed" attempts into ONE line (flaky) instead of duplicates.
- * - NOTHING ELSE in the Slack message format was changed.
+ * Vercel-safe version:
+ * - Waits for processing before returning 200 on /qase/webhook
+ * - Exports Express app for serverless deployment
+ * - Still supports local run with app.listen(...)
  */
 
 require('dotenv').config();
@@ -28,30 +15,33 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v20 (SINGLE MESSAGE + SUMMARY + SNAPSHOT TITLE + AGGREGATE + NO REASON)';
+  'QASE->SLACK v21 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + SNAPSHOT TITLE + AGGREGATE + NO REASON)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
+
 function missingEnvs() {
   return REQUIRED_ENVS.filter((k) => !process.env[k] || String(process.env[k]).trim() === '');
 }
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
-console.log('SLACK_WEBHOOK_URL =', SLACK_WEBHOOK_URL);
 const QASE_API_TOKEN = process.env.QASE_API_TOKEN;
 const QASE_PROJECT_CODE = process.env.QASE_PROJECT_CODE;
 const PORT = Number(process.env.PORT || 3000);
 
 const QASE_BASE = 'https://api.qase.io/v1';
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const ts = () => new Date().toISOString().replace('T', ' ').replace('Z', 'Z');
-const log = (...a) => console.log(`[${ts()}]`, ...a);
+const log = (...args) => console.log(`[${ts()}]`, ...args);
 
 const DISCLAIMER =
   'Important: Not all failed tests indicate a software defect. Some failures can be caused by temporary environment issues (e.g., slow response times, network instability, third-party outages, or test runner constraints) and may require a rerun to confirm.';
 
 function qaseHeaders() {
-  return { 'Content-Type': 'application/json', Token: QASE_API_TOKEN };
+  return {
+    'Content-Type': 'application/json',
+    Token: QASE_API_TOKEN,
+  };
 }
 
 // Denmark date (DD/MM/YYYY) + English "Week X"
@@ -82,8 +72,8 @@ function formatRunDateDenmarkWithWeek() {
   const d = Number(partsYMD.find((p) => p.type === 'day')?.value);
 
   const dt = new Date(Date.UTC(y, m - 1, d));
-  const day = dt.getUTCDay() || 7; // Mon=1..Sun=7
-  dt.setUTCDate(dt.getUTCDate() + 4 - day); // Thursday
+  const day = dt.getUTCDay() || 7;
+  dt.setUTCDate(dt.getUTCDate() + 4 - day);
   const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
   const week = Math.ceil((((dt - yearStart) / 86400000) + 1) / 7);
 
@@ -92,7 +82,11 @@ function formatRunDateDenmarkWithWeek() {
 
 async function qaseGet(path) {
   const url = `${QASE_BASE}${path}`;
-  const res = await fetch(url, { method: 'GET', headers: qaseHeaders() });
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: qaseHeaders(),
+  });
+
   const json = await res.json().catch(() => null);
 
   if (!res.ok) {
@@ -103,10 +97,12 @@ async function qaseGet(path) {
     err.url = url;
     throw err;
   }
+
   return json;
 }
 
 /* ---------------- STATUS ---------------- */
+
 const STATUS = {
   PASSED: 'passed',
   FAILED: 'failed',
@@ -131,7 +127,11 @@ function normalizeStatus(raw) {
       raw.id ??
       raw.status_id ??
       raw.statusId;
-    if (candidate !== undefined && candidate !== null) return normalizeStatus(candidate);
+
+    if (candidate !== undefined && candidate !== null) {
+      return normalizeStatus(candidate);
+    }
+
     return STATUS.BLOCKED;
   }
 
@@ -187,6 +187,7 @@ function statusRank(s) {
 }
 
 /* ---------------- TITLE helpers ---------------- */
+
 function extractCaseId(r) {
   const v =
     r?.case_id ??
@@ -202,12 +203,12 @@ function extractCaseId(r) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// No failure reason in Slack: only short suffix signals
 function resultSuffix(r) {
   const bits = [];
 
   const param = r?.param || r?.params || r?.parameters;
   if (param && typeof param === 'string') bits.push(param);
+
   if (param && typeof param === 'object') {
     const s = JSON.stringify(param);
     if (s && s !== '{}' && s !== 'null') bits.push(s);
@@ -226,6 +227,7 @@ function resultSuffix(r) {
 function isBadTitle(t) {
   const s = String(t || '').trim();
   if (!s) return true;
+
   const low = s.toLowerCase();
   return (
     low.startsWith('error:') ||
@@ -249,7 +251,6 @@ function cleanupSnapshotDerivedTitle(s) {
   return t || null;
 }
 
-// snapshot-id -> URL (supports en_int)
 function snapshotIdToUrl(snapshotId) {
   const s = String(snapshotId || '').trim();
   if (!s) return null;
@@ -344,6 +345,7 @@ function bestTitleFromResult(r) {
 }
 
 /* ---------------- Failure inference ---------------- */
+
 function inferFailedFromResult(r) {
   const comment = typeof r?.comment === 'string' ? r.comment : '';
   const stack = typeof r?.stacktrace === 'string' ? r.stacktrace : '';
@@ -361,10 +363,6 @@ function inferFailedFromResult(r) {
   return Boolean(hasErrorWord || hasAssertion || hasAttachments);
 }
 
-/**
- * Infer "flaky" when a test was retried and passed.
- * Best-effort across integrations.
- */
 function inferFlakyFromResult(r) {
   if (!r || typeof r !== 'object') return false;
 
@@ -399,25 +397,33 @@ function inferFlakyFromResult(r) {
 
   const comment = typeof r.comment === 'string' ? r.comment : '';
   const stack = typeof r.stacktrace === 'string' ? r.stacktrace : '';
-  if (/retry|re-?run|rerun|flaky/i.test(comment) || /retry|re-?run|rerun|flaky/i.test(stack)) return true;
+  if (/retry|re-?run|rerun|flaky/i.test(comment) || /retry|re-?run|rerun|flaky/i.test(stack)) {
+    return true;
+  }
 
   return false;
 }
 
 /* ---------------- Slack ---------------- */
+
 async function sendToSlack(payload) {
-  log(`[SLACK] Sending message...`);
+  log('[SLACK] Sending message...');
   const res = await fetch(SLACK_WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
+
   const txt = await res.text().catch(() => '');
   log(`[SLACK] HTTP ${res.status} ok=${res.ok} body=${(txt || '').slice(0, 200)}`);
-  if (!res.ok) throw new Error(`Slack webhook failed: HTTP ${res.status}`);
+
+  if (!res.ok) {
+    throw new Error(`Slack webhook failed: HTTP ${res.status}`);
+  }
 }
 
 /* ---------------- Qase ---------------- */
+
 async function fetchRunMeta(runId) {
   const path = `/run/${encodeURIComponent(QASE_PROJECT_CODE)}/${encodeURIComponent(runId)}?include=cases`;
   const json = await qaseGet(path);
@@ -460,7 +466,7 @@ async function fetchResultsForRunStrict(runId, startedAtUnix, options = {}) {
         .sort((a, b) => a - b)[0];
 
       if (hasRunMatches && startedAtUnix && minCreated && minCreated < startedAtUnix) {
-        log(`[QASE] Found run results and reached older pages. Stopping pagination.`);
+        log('[QASE] Found run results and reached older pages. Stopping pagination.');
         break;
       }
 
@@ -470,15 +476,18 @@ async function fetchResultsForRunStrict(runId, startedAtUnix, options = {}) {
     if (collected.length) {
       const seen = new Set();
       const uniq = [];
+
       for (const r of collected) {
         const key =
           r.id ??
           r.hash ??
           `${r.run_id}:${extractCaseId(r) || 'nocase'}:${String(r.status)}:${r.end_time || r.created || r.created_at || ''}`;
+
         if (seen.has(key)) continue;
         seen.add(key);
         uniq.push(r);
       }
+
       log(`[QASE] Results for run ${runId}: ${uniq.length} found.`);
       return uniq;
     }
@@ -491,6 +500,7 @@ async function fetchResultsForRunStrict(runId, startedAtUnix, options = {}) {
 }
 
 const caseTitleCache = new Map();
+
 async function fetchCaseTitle(caseId) {
   if (!caseId) return null;
   if (caseTitleCache.has(caseId)) return caseTitleCache.get(caseId);
@@ -500,18 +510,19 @@ async function fetchCaseTitle(caseId) {
     json?.result?.title && String(json.result.title).trim()
       ? String(json.result.title).trim()
       : `Case #${caseId}`;
+
   caseTitleCache.set(caseId, t);
   return t;
 }
 
 /* ---------------- aggregation ---------------- */
+
 function mergeKeyForResult(r) {
   const caseId = extractCaseId(r);
   if (caseId) return `case:${caseId}`;
   if (r?.hash) return `hash:${r.hash}`;
   if (r?.id) return `id:${r.id}`;
 
-  // ✅ deterministic fallback (prevents "failed+passed" duplicates when no case_id/hash/id)
   const title = bestTitleFromResult(r) || 'unknown';
   const browser = r?.browser || r?.metadata?.browser || '';
   const env = r?.environment || r?.metadata?.env || '';
@@ -530,27 +541,24 @@ function pickBetterTitle(a, b) {
   return String(b).length < String(a).length ? b : a;
 }
 
-// ✅ combine statuses so fail+pass => flaky
 function combineStatus(existing, incoming) {
   if (!existing) return incoming;
 
-  // normalize invalid as fail-like
   const ex = existing === STATUS.INVALID ? STATUS.FAILED : existing;
   const inc = incoming === STATUS.INVALID ? STATUS.FAILED : incoming;
 
-  // If either already flaky, keep flaky
   if (ex === STATUS.FLAKY || inc === STATUS.FLAKY) return STATUS.FLAKY;
 
-  // If we see both pass and fail across attempts -> flaky
   const passFailCombo =
     (ex === STATUS.PASSED && inc === STATUS.FAILED) || (ex === STATUS.FAILED && inc === STATUS.PASSED);
+
   if (passFailCombo) return STATUS.FLAKY;
 
-  // Otherwise keep the "worse" by rank (failed > blocked > skipped > flaky > passed)
   return statusRank(inc) < statusRank(ex) ? incoming : existing;
 }
 
 /* ---------------- processing queue-safe per runId ---------------- */
+
 const processingByRunId = new Map();
 
 async function processRunCompleted(projectCode, runId) {
@@ -578,6 +586,7 @@ async function processRunCompleted(projectCode, runId) {
 
     const runCases = Array.isArray(runMeta?.cases) ? runMeta.cases : [];
     const caseMap = new Map();
+
     for (const c of runCases) {
       const cid = Number(c?.case_id ?? c?.id ?? c?.case?.id);
       if (!Number.isFinite(cid) || cid <= 0) continue;
@@ -610,6 +619,7 @@ async function processRunCompleted(projectCode, runId) {
           `Run link: ${runLink}\n\n` +
           `No results returned from Qase API.`,
       });
+
       return;
     }
 
@@ -621,14 +631,12 @@ async function processRunCompleted(projectCode, runId) {
       let status = normalizeStatus(r?.status ?? r?.status_id ?? r?.statusId ?? r?.result ?? r?.state);
       if (status === STATUS.INVALID && inferFailedFromResult(r)) status = STATUS.FAILED;
 
-      // ✅ apply caseMap override first (as you had), but DON'T let it kill flaky later
       if (caseId && caseMap.has(caseId)) {
         const s2 = caseMap.get(caseId)?.status;
         if (s2 && s2 !== STATUS.INVALID) status = s2;
         if (status === STATUS.INVALID && s2 === STATUS.FAILED) status = STATUS.FAILED;
       }
 
-      // ✅ NOW apply flaky inference (so it is not overwritten by caseMap)
       if (inferFlakyFromResult(r)) {
         status = STATUS.FLAKY;
       }
@@ -662,7 +670,15 @@ async function processRunCompleted(projectCode, runId) {
 
     const lines = Array.from(aggregated.values());
 
-    const counts = { passed: 0, failed: 0, flaky: 0, skipped: 0, blocked: 0, invalid: 0 };
+    const counts = {
+      passed: 0,
+      failed: 0,
+      flaky: 0,
+      skipped: 0,
+      blocked: 0,
+      invalid: 0,
+    };
+
     for (const l of lines) {
       if (l.status === STATUS.PASSED) counts.passed++;
       else if (l.status === STATUS.FAILED) counts.failed++;
@@ -672,10 +688,17 @@ async function processRunCompleted(projectCode, runId) {
       else counts.blocked++;
     }
 
-    const order = { failed: 0, invalid: 1, blocked: 2, flaky: 3, skipped: 4, passed: 5 };
+    const order = {
+      failed: 0,
+      invalid: 1,
+      blocked: 2,
+      flaky: 3,
+      skipped: 4,
+      passed: 5,
+    };
+
     lines.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
 
-    // ✅ SINGLE FINAL MESSAGE (unchanged formatting)
     await sendToSlack({
       text:
         `*Automation Regression Tests*\n\n` +
@@ -698,17 +721,20 @@ async function processRunCompleted(projectCode, runId) {
 }
 
 /* ---------------- routes ---------------- */
-app.get('/health', (_req, res) => res.status(200).send('ok'));
+
+app.get('/health', (_req, res) => {
+  res.status(200).send('ok');
+});
 
 app.post('/qase/webhook', async (req, res) => {
-  // ACK immediately
-  res.status(200).json({ ok: true });
-
   try {
     const missing = missingEnvs();
     if (missing.length) {
       log(`Webhook processing error: Missing env vars: ${missing.join(', ')}`);
-      return;
+      return res.status(500).json({
+        ok: false,
+        error: `Missing env vars: ${missing.join(', ')}`,
+      });
     }
 
     const eventName = req.body?.event_name;
@@ -719,28 +745,58 @@ app.post('/qase/webhook', async (req, res) => {
     if (eventName === 'run.started') {
       const runId = req.body?.payload?.id;
       if (runId) log(`[QASE] Run started: ${runId}`);
-      return;
+      return res.status(200).json({ ok: true, ignored: false, event: eventName });
     }
 
-    if (eventName !== 'run.completed') return;
+    if (eventName !== 'run.completed') {
+      return res.status(200).json({ ok: true, ignored: true, event: eventName });
+    }
 
     const runId = req.body?.payload?.id;
     if (!runId) {
       log('[QASE] Missing payload.id (runId).');
-      return;
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing payload.id (runId)',
+      });
     }
 
-    processRunCompleted(projectCode, runId).catch((e) => {
-      log(`[ERROR] Run ${runId} processing failed: ${e.message}`);
+    await processRunCompleted(projectCode, runId);
+
+    return res.status(200).json({
+      ok: true,
+      processed: true,
+      runId,
     });
   } catch (err) {
-    log('Webhook processing error:', { message: err.message, url: err.url, status: err.status });
+    log('Webhook processing error:', {
+      message: err.message,
+      url: err.url,
+      status: err.status,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'Internal server error',
+    });
   }
 });
 
-app.listen(PORT, () => {
+/* ---------------- local + export ---------------- */
+
+if (require.main === module) {
+  log(`SLACK_WEBHOOK_URL configured: ${Boolean(SLACK_WEBHOOK_URL)}`);
   log(`=== MIDDLEWARE VERSION: ${VERSION} ===`);
   log(`Middleware running on port ${PORT}`);
+
   const missing = missingEnvs();
-  if (missing.length) log(`[WARN] Missing env vars: ${missing.join(', ')}`);
-});
+  if (missing.length) {
+    log(`[WARN] Missing env vars: ${missing.join(', ')}`);
+  }
+
+  app.listen(PORT, () => {
+    log(`HTTP server listening on port ${PORT}`);
+  });
+}
+
+module.exports = app;
