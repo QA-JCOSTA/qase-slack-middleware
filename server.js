@@ -604,7 +604,7 @@ async function processRunCompleted(projectCode, runId) {
       await sendToSlack({
         text:
           `*Automation Regression Tests*\n\n` +
-          `Project: *${projectCode}* | Run: *${runId}*\n` +
+          `Project: *${projectCode}*\n` +
           `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
           `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
           `Run link: ${runLink}\n\n` +
