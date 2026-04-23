@@ -1,0 +1,16 @@
+{
+  "name": "qase-slack-middleware",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^17.3.1",
+    "express": "^4.19.2"
+  }
+}
