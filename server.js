@@ -36,7 +36,14 @@ const log = (...args) => console.log(`[${ts()}]`, ...args);
 
 const DISCLAIMER =
   'Important: Not all failed tests indicate a software defect. Some failures can be caused by temporary environment issues (e.g., slow response times, network instability, third-party outages, or test runner constraints) and may require a rerun to confirm.';
-
+log('[ENV DEBUG] SLACK_WEBHOOK_URL exists:', Boolean(SLACK_WEBHOOK_URL));
+log('[ENV DEBUG] SLACK_WEBHOOK_URL length:', SLACK_WEBHOOK_URL?.length || 0);
+log(
+  '[ENV DEBUG] SLACK_WEBHOOK_URL preview:',
+  SLACK_WEBHOOK_URL
+    ? `${SLACK_WEBHOOK_URL.slice(0, 35)}...${SLACK_WEBHOOK_URL.slice(-8)}`
+    : 'MISSING'
+);
 function qaseHeaders() {
   return {
     'Content-Type': 'application/json',
