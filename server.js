@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v23 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + QASE PUBLIC REPORT LINK FALLBACK)';
+  'QASE->SLACK v24 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + PUBLIC QASE REPORT LINK)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -71,27 +71,45 @@ function findFirstUrlDeep(value, matcher, depth = 0) {
   return null;
 }
 
-function extractQasePublicReportUrl(runMeta) {
-  if (!runMeta || typeof runMeta !== 'object') return null;
+function extractQasePublicReportUrl(payload) {
+  if (!payload || typeof payload !== 'object') return null;
 
   const directCandidates = [
-    runMeta.public_report_url,
-    runMeta.publicReportUrl,
-    runMeta.public_url,
-    runMeta.publicUrl,
-    runMeta.report_url,
-    runMeta.reportUrl,
-    runMeta.share_url,
-    runMeta.shareUrl,
-    runMeta.shared_url,
-    runMeta.sharedUrl,
-    runMeta.public_link,
-    runMeta.publicLink,
-    runMeta.report?.public_url,
-    runMeta.report?.publicUrl,
-    runMeta.report?.url,
-    runMeta.share?.url,
-    runMeta.public?.url,
+    payload.public_report_url,
+    payload.publicReportUrl,
+    payload.public_url,
+    payload.publicUrl,
+    payload.report_url,
+    payload.reportUrl,
+    payload.share_url,
+    payload.shareUrl,
+    payload.shared_url,
+    payload.sharedUrl,
+    payload.public_link,
+    payload.publicLink,
+    payload.url,
+    payload.link,
+
+    payload.result?.public_report_url,
+    payload.result?.publicReportUrl,
+    payload.result?.public_url,
+    payload.result?.publicUrl,
+    payload.result?.report_url,
+    payload.result?.reportUrl,
+    payload.result?.share_url,
+    payload.result?.shareUrl,
+    payload.result?.shared_url,
+    payload.result?.sharedUrl,
+    payload.result?.public_link,
+    payload.result?.publicLink,
+    payload.result?.url,
+    payload.result?.link,
+
+    payload.result?.report?.public_url,
+    payload.result?.report?.publicUrl,
+    payload.result?.report?.url,
+    payload.result?.share?.url,
+    payload.result?.public?.url,
   ];
 
   for (const candidate of directCandidates) {
@@ -103,15 +121,11 @@ function extractQasePublicReportUrl(runMeta) {
     }
   }
 
-  return findFirstUrlDeep(
-    runMeta,
-    /^https:\/\/app\.qase\.io\/public\/report\//i
-  );
+  return findFirstUrlDeep(payload, /^https:\/\/app\.qase\.io\/public\/report\//i);
 }
 
-function formatQaseReportLine(reportLink, label = 'Qase report') {
+function formatQaseReportLine(reportLink, label = 'Qase public report') {
   if (!reportLink) return '';
-
   return `*${label}:* <${reportLink}|Open report>\n\n`;
 }
 
@@ -170,6 +184,37 @@ async function qaseGet(path) {
   }
 
   return json;
+}
+
+async function makeRunPublic(projectCode, runId) {
+  const url = `${QASE_BASE}/run/${encodeURIComponent(projectCode)}/${encodeURIComponent(runId)}/public`;
+
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: qaseHeaders(),
+    body: JSON.stringify({
+      status: true,
+    }),
+  });
+
+  const json = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    const msg = json?.errorMessage || json?.message || json?.error || `HTTP ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.body = json;
+    err.url = url;
+    throw err;
+  }
+
+  const publicUrl = extractQasePublicReportUrl(json);
+
+  if (!publicUrl) {
+    log('[QASE] makeRunPublic response did not include public URL:', JSON.stringify(json, null, 2).slice(0, 4000));
+  }
+
+  return publicUrl;
 }
 
 /* ---------------- STATUS ---------------- */
@@ -300,6 +345,7 @@ function isBadTitle(t) {
   if (!s) return true;
 
   const low = s.toLowerCase();
+
   return (
     low.startsWith('error:') ||
     low.includes('expect(') ||
@@ -341,6 +387,7 @@ function snapshotIdToUrl(snapshotId) {
 
   const domain = domainPart.replace(/-/g, '.');
   const path = pathParts.join('_').replace(/_/g, '/');
+
   if (!path) return null;
 
   return `https://${domain}/${lang}/${region}/${path}`;
@@ -353,6 +400,7 @@ function formatVisualTitleFromUrl(url) {
 
 function titleFromErrorText(text) {
   if (!text || typeof text !== 'string') return null;
+
   const t = text.replace(/\r/g, '\n');
 
   const vr = t.match(/(Visual Regression Test\s*-\s*[^\n]+)/i);
@@ -412,6 +460,7 @@ function bestTitleFromResult(r) {
 
   if (r?.id) return `Test result #${r.id}`;
   if (r?.hash) return `Test ${String(r.hash).slice(0, 10)}`;
+
   return 'Unknown test';
 }
 
@@ -461,6 +510,7 @@ function inferFlakyFromResult(r) {
 
     const hasFail = statuses.includes(STATUS.FAILED) || statuses.includes(STATUS.INVALID);
     const hasPass = statuses.includes(STATUS.PASSED);
+
     if (hasFail && hasPass) return true;
   }
 
@@ -468,6 +518,7 @@ function inferFlakyFromResult(r) {
 
   const comment = typeof r.comment === 'string' ? r.comment : '';
   const stack = typeof r.stacktrace === 'string' ? r.stacktrace : '';
+
   if (/retry|re-?run|rerun|flaky/i.test(comment) || /retry|re-?run|rerun|flaky/i.test(stack)) {
     return true;
   }
@@ -479,6 +530,7 @@ function inferFlakyFromResult(r) {
 
 async function sendToSlack(payload) {
   log('[SLACK] Sending message...');
+
   const res = await fetch(SLACK_WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -523,6 +575,7 @@ async function fetchResultsForRunStrict(runId, startedAtUnix, options = {}) {
 
       const page = await fetchAllResultsPage(limit, offset);
       const entities = Array.isArray(page?.entities) ? page.entities : [];
+
       if (!entities.length) break;
 
       const matches = entities.filter((e) => Number(e.run_id) === Number(runId));
@@ -555,6 +608,7 @@ async function fetchResultsForRunStrict(runId, startedAtUnix, options = {}) {
           `${r.run_id}:${extractCaseId(r) || 'nocase'}:${String(r.status)}:${r.end_time || r.created || r.created_at || ''}`;
 
         if (seen.has(key)) continue;
+
         seen.add(key);
         uniq.push(r);
       }
@@ -577,6 +631,7 @@ async function fetchCaseTitle(caseId) {
   if (caseTitleCache.has(caseId)) return caseTitleCache.get(caseId);
 
   const json = await qaseGet(`/case/${encodeURIComponent(QASE_PROJECT_CODE)}/${encodeURIComponent(caseId)}`);
+
   const t =
     json?.result?.title && String(json.result.title).trim()
       ? String(json.result.title).trim()
@@ -590,6 +645,7 @@ async function fetchCaseTitle(caseId) {
 
 function mergeKeyForResult(r) {
   const caseId = extractCaseId(r);
+
   if (caseId) return `case:${caseId}`;
   if (r?.hash) return `hash:${r.hash}`;
   if (r?.id) return `id:${r.id}`;
@@ -598,6 +654,7 @@ function mergeKeyForResult(r) {
   const browser = r?.browser || r?.metadata?.browser || '';
   const env = r?.environment || r?.metadata?.env || '';
   const param = typeof r?.param === 'string' ? r.param : '';
+
   return `title:${title}|browser:${browser}|env:${env}|param:${param}`;
 }
 
@@ -609,6 +666,7 @@ function pickBetterTitle(a, b) {
   if (!aBad && bBad) return a;
 
   if (!aBad && !bBad) return String(b).length > String(a).length ? b : a;
+
   return String(b).length < String(a).length ? b : a;
 }
 
@@ -645,24 +703,26 @@ async function processRunCompleted(projectCode, runId) {
 
     log(`[QASE] Run completed: ${runId}`);
 
+    const publicRunLink = await makeRunPublic(projectCode, runId).catch((e) => {
+      log(`[QASE] Failed to make run public: ${e.message}`);
+      return null;
+    });
+
+    if (publicRunLink) {
+      qaseReportLink = publicRunLink;
+      qaseReportLabel = 'Qase public report';
+      log(`[QASE] Public report link: ${publicRunLink}`);
+    } else {
+      log(`[QASE] Falling back to private run link: ${privateRunLink}`);
+    }
+
     const runMeta = await fetchRunMeta(runId).catch((e) => {
       log(`[QASE] Failed to fetch run meta: ${e.message}`);
       return null;
     });
 
-    log('[QASE] Run meta preview:', JSON.stringify(runMeta, null, 2).slice(0, 4000));
-
-    const publicReportLink = extractQasePublicReportUrl(runMeta);
-
-    if (publicReportLink) {
-      qaseReportLink = publicReportLink;
-      qaseReportLabel = 'Qase public report';
-      log(`[QASE] Public report link found: ${publicReportLink}`);
-    } else {
-      log(`[QASE] Public report link not found in run meta. Falling back to private run link: ${privateRunLink}`);
-    }
-
     let startedAtUnix = 0;
+
     if (runMeta?.start_time && typeof runMeta.start_time === 'string') {
       const ms = Date.parse(runMeta.start_time);
       if (Number.isFinite(ms)) startedAtUnix = Math.floor(ms / 1000);
@@ -675,6 +735,7 @@ async function processRunCompleted(projectCode, runId) {
 
     for (const c of runCases) {
       const cid = Number(c?.case_id ?? c?.id ?? c?.case?.id);
+
       if (!Number.isFinite(cid) || cid <= 0) continue;
 
       const title =
@@ -685,6 +746,7 @@ async function processRunCompleted(projectCode, runId) {
             : null;
 
       const st = normalizeStatus(c?.status ?? c?.status_id ?? c?.result ?? c?.state);
+
       caseMap.set(cid, { title, status: st });
     }
 
@@ -715,10 +777,12 @@ async function processRunCompleted(projectCode, runId) {
       const caseId = extractCaseId(r);
 
       let status = normalizeStatus(r?.status ?? r?.status_id ?? r?.statusId ?? r?.result ?? r?.state);
+
       if (status === STATUS.INVALID && inferFailedFromResult(r)) status = STATUS.FAILED;
 
       if (caseId && caseMap.has(caseId)) {
         const s2 = caseMap.get(caseId)?.status;
+
         if (s2 && s2 !== STATUS.INVALID) status = s2;
         if (status === STATUS.INVALID && s2 === STATUS.FAILED) status = STATUS.FAILED;
       }
@@ -728,8 +792,10 @@ async function processRunCompleted(projectCode, runId) {
       }
 
       let title;
+
       if (caseId) {
         title = caseMap.get(caseId)?.title || null;
+
         if (!title || String(title).trim().toLowerCase().startsWith('case #')) {
           title = await fetchCaseTitle(caseId).catch(() => `Case #${caseId}`);
         }
@@ -750,6 +816,7 @@ async function processRunCompleted(projectCode, runId) {
       } else {
         const mergedStatus = combineStatus(existing.status, status);
         const betterTitle = pickBetterTitle(existing.title, title);
+
         aggregated.set(key, { title: betterTitle, status: mergedStatus });
       }
     }
@@ -816,8 +883,10 @@ app.get('/health', (_req, res) => {
 app.post('/qase/webhook', async (req, res) => {
   try {
     const missing = missingEnvs();
+
     if (missing.length) {
       log(`Webhook processing error: Missing env vars: ${missing.join(', ')}`);
+
       return res.status(500).json({
         ok: false,
         error: `Missing env vars: ${missing.join(', ')}`,
@@ -832,16 +901,27 @@ app.post('/qase/webhook', async (req, res) => {
     if (eventName === 'run.started') {
       const runId = req.body?.payload?.id;
       if (runId) log(`[QASE] Run started: ${runId}`);
-      return res.status(200).json({ ok: true, ignored: false, event: eventName });
+
+      return res.status(200).json({
+        ok: true,
+        ignored: false,
+        event: eventName,
+      });
     }
 
     if (eventName !== 'run.completed') {
-      return res.status(200).json({ ok: true, ignored: true, event: eventName });
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        event: eventName,
+      });
     }
 
     const runId = req.body?.payload?.id;
+
     if (!runId) {
       log('[QASE] Missing payload.id (runId).');
+
       return res.status(400).json({
         ok: false,
         error: 'Missing payload.id (runId)',
@@ -877,6 +957,7 @@ if (require.main === module) {
   log(`Middleware running on port ${PORT}`);
 
   const missing = missingEnvs();
+
   if (missing.length) {
     log(`[WARN] Missing env vars: ${missing.join(', ')}`);
   }
