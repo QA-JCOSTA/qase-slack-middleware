@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v22 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + PLAYWRIGHT REPORT URL)';
+  'QASE->SLACK v21 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + SNAPSHOT TITLE + AGGREGATE + NO REASON)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -26,7 +26,6 @@ function missingEnvs() {
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const QASE_API_TOKEN = process.env.QASE_API_TOKEN;
 const QASE_PROJECT_CODE = process.env.QASE_PROJECT_CODE;
-const PLAYWRIGHT_REPORT_URL = process.env.PLAYWRIGHT_REPORT_URL || '';
 const PORT = Number(process.env.PORT || 3000);
 
 const QASE_BASE = 'https://api.qase.io/v1';
@@ -37,16 +36,6 @@ const log = (...args) => console.log(`[${ts()}]`, ...args);
 
 const DISCLAIMER =
   'Important: Not all failed tests indicate a software defect. Some failures can be caused by temporary environment issues (e.g., slow response times, network instability, third-party outages, or test runner constraints) and may require a rerun to confirm.';
-
-function formatPlaywrightReportLine() {
-  const url = String(PLAYWRIGHT_REPORT_URL || '').trim();
-
-  if (!url) {
-    return '';
-  }
-
-  return `Playwright report: ${url}\n\n`;
-}
 
 function qaseHeaders() {
   return {
@@ -622,14 +611,14 @@ async function processRunCompleted(projectCode, runId) {
 
     if (!results.length) {
       await sendToSlack({
-  text:
-    `*Automation Regression Tests*\n\n` +
-    `*Qase report:* ${runLink}\n\n` +
-    `Project: *${projectCode}*\n` +
-    `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
-    `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
-    `No results returned from Qase API.`,
-});
+        text:
+          `*Automation Regression Tests*\n\n` +
+          `Project: *${projectCode}*\n` +
+          `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
+          `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
+          `Run link: ${runLink}\n\n` +
+          `No results returned from Qase API.`,
+      });
 
       return;
     }
@@ -711,18 +700,17 @@ async function processRunCompleted(projectCode, runId) {
     lines.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
 
     await sendToSlack({
-  text:
-    `*Automation Regression Tests*\n\n` +
-    `*Qase report:* ${runLink}\n\n` +
-    `Project: *${projectCode}* | Run: *${runId}*\n` +
-    `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
-    `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
-    `Passed: *${counts.passed}* | Failed: *${counts.failed}* | Flaky: *${counts.flaky}* | ` +
-    `Skipped: *${counts.skipped}* | Blocked: *${counts.blocked}* | Invalid: *${counts.invalid}*\n\n` +
-    `_${DISCLAIMER}_\n\n` +
-    `*Test case results (${lines.length}):*\n` +
-    lines.map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`).join('\n'),
-});
+      text:
+        `*Automation Regression Tests*\n\n` +
+        `Project: *${projectCode}* | Run: *${runId}*\n` +
+        `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
+        `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
+        `Passed: *${counts.passed}* | Failed: *${counts.failed}* | Flaky: *${counts.flaky}* | ` +
+        `Skipped: *${counts.skipped}* | Blocked: *${counts.blocked}* | Invalid: *${counts.invalid}*\n\n` +
+        `_${DISCLAIMER}_\n\n` +
+        `*Test case results (${lines.length}):*\n` +
+        lines.map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`).join('\n'),
+    });
 
     log(`[DONE] Run ${runId} processed. lines=${lines.length}`);
   })();
@@ -798,7 +786,6 @@ app.post('/qase/webhook', async (req, res) => {
 
 if (require.main === module) {
   log(`SLACK_WEBHOOK_URL configured: ${Boolean(SLACK_WEBHOOK_URL)}`);
-  log(`PLAYWRIGHT_REPORT_URL configured: ${Boolean(PLAYWRIGHT_REPORT_URL)}`);
   log(`=== MIDDLEWARE VERSION: ${VERSION} ===`);
   log(`Middleware running on port ${PORT}`);
 
