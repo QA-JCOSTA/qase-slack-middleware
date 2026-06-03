@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v21 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + SNAPSHOT TITLE + AGGREGATE + NO REASON)';
+  'QASE->SLACK v22 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + QASE REPORT LINK)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -42,6 +42,11 @@ function qaseHeaders() {
     'Content-Type': 'application/json',
     Token: QASE_API_TOKEN,
   };
+}
+
+function formatQaseReportLine(runLink) {
+  if (!runLink) return '';
+  return `*Test run report:* ${runLink}\n\n`;
 }
 
 // Denmark date (DD/MM/YYYY) + English "Week X"
@@ -613,10 +618,10 @@ async function processRunCompleted(projectCode, runId) {
       await sendToSlack({
         text:
           `*Automation Regression Tests*\n\n` +
+          formatQaseReportLine(runLink) +
           `Project: *${projectCode}*\n` +
           `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
           `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
-          `Run link: ${runLink}\n\n` +
           `No results returned from Qase API.`,
       });
 
@@ -702,6 +707,7 @@ async function processRunCompleted(projectCode, runId) {
     await sendToSlack({
       text:
         `*Automation Regression Tests*\n\n` +
+        formatQaseReportLine(runLink) +
         `Project: *${projectCode}* | Run: *${runId}*\n` +
         `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
         `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
