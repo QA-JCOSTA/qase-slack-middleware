@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v26 (PUBLIC REPORT + SIMPLE STATUS OVERVIEW WITH ICONS)';
+  'QASE->SLACK v27 (PUBLIC REPORT + STATUS OVERVIEW + FAILED TEST BROWSER)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -299,7 +299,7 @@ function statusRank(s) {
   return 5;
 }
 
-/* ---------------- TITLE helpers ---------------- */
+/* ---------------- TITLE / BROWSER helpers ---------------- */
 
 function extractCaseId(r) {
   const v =
@@ -316,22 +316,74 @@ function extractCaseId(r) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function getResultBrowser(r) {
+  const param = r?.param || r?.params || r?.parameters;
+
+  if (typeof param === 'object' && param) {
+    const browserFromParam =
+      param.browser ||
+      param.Browser ||
+      param.project ||
+      param.Project ||
+      param.device ||
+      param.Device;
+
+    if (browserFromParam) return String(browserFromParam);
+  }
+
+  if (typeof param === 'string') {
+    const match = param.match(/chrome|edge|firefox|safari|webkit|mobile/i);
+    if (match) return match[0];
+  }
+
+  return (
+    r?.browser ||
+    r?.metadata?.browser ||
+    r?.environment ||
+    r?.metadata?.env ||
+    r?.env ||
+    r?.platform ||
+    null
+  );
+}
+
 function resultSuffix(r) {
   const bits = [];
 
   const param = r?.param || r?.params || r?.parameters;
-  if (param && typeof param === 'string') bits.push(param);
+  const browser = getResultBrowser(r);
 
-  if (param && typeof param === 'object') {
-    const s = JSON.stringify(param);
-    if (s && s !== '{}' && s !== 'null') bits.push(s);
+  if (browser) {
+    bits.push(`Browser: ${browser}`);
   }
 
-  const browser = r?.browser || r?.metadata?.browser;
-  if (browser) bits.push(browser);
+  if (param && typeof param === 'string') {
+    if (!/chrome|edge|firefox|safari|webkit|mobile|browser/i.test(param)) {
+      bits.push(param);
+    }
+  }
+
+  if (param && typeof param === 'object') {
+    const cleanParam = { ...param };
+
+    delete cleanParam.browser;
+    delete cleanParam.Browser;
+    delete cleanParam.project;
+    delete cleanParam.Project;
+    delete cleanParam.device;
+    delete cleanParam.Device;
+
+    const s = JSON.stringify(cleanParam);
+
+    if (s && s !== '{}' && s !== 'null') {
+      bits.push(s);
+    }
+  }
 
   const env = r?.environment || r?.metadata?.env;
-  if (env) bits.push(env);
+  if (env && env !== browser) {
+    bits.push(env);
+  }
 
   const suffix = bits.filter(Boolean).join(' | ').trim();
   return suffix ? ` — ${suffix}` : '';
@@ -648,7 +700,7 @@ function mergeKeyForResult(r) {
   if (r?.id) return `id:${r.id}`;
 
   const title = bestTitleFromResult(r) || 'unknown';
-  const browser = r?.browser || r?.metadata?.browser || '';
+  const browser = getResultBrowser(r) || '';
   const env = r?.environment || r?.metadata?.env || '';
   const param = typeof r?.param === 'string' ? r.param : '';
 
@@ -718,7 +770,7 @@ function buildSlackMessage({
   const attentionSummary =
     importantLines.length > 0
       ? `*Tests requiring attention:*\n${importantLines
-          .map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`)
+          .map((l) => `${statusEmoji(l.status)} ${l.title} — Browser: *${l.browser || 'Unknown'}* — *${l.status}*`)
           .join('\n')}`
       : `All test cases passed successfully.`;
 
@@ -863,18 +915,31 @@ async function processRunCompleted(projectCode, runId) {
       const urlFromTitle = snapshotIdToUrl(title);
       if (urlFromTitle) title = formatVisualTitleFromUrl(urlFromTitle);
 
-      title = `${title}${resultSuffix(r)}`;
+      const browser = getResultBrowser(r) || 'Unknown';
+      const titleWithSuffix = `${title}${resultSuffix(r)}`;
 
       const key = mergeKeyForResult(r);
       const existing = aggregated.get(key);
 
       if (!existing) {
-        aggregated.set(key, { title, status });
+        aggregated.set(key, {
+          title: titleWithSuffix,
+          status,
+          browser,
+        });
       } else {
         const mergedStatus = combineStatus(existing.status, status);
-        const betterTitle = pickBetterTitle(existing.title, title);
+        const betterTitle = pickBetterTitle(existing.title, titleWithSuffix);
+        const betterBrowser =
+          existing.browser && existing.browser !== 'Unknown'
+            ? existing.browser
+            : browser;
 
-        aggregated.set(key, { title: betterTitle, status: mergedStatus });
+        aggregated.set(key, {
+          title: betterTitle,
+          status: mergedStatus,
+          browser: betterBrowser,
+        });
       }
     }
 
