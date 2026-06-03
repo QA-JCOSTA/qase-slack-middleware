@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v24 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + PUBLIC QASE REPORT LINK)';
+  'QASE->SLACK v26 (PUBLIC REPORT + SIMPLE STATUS OVERVIEW WITH ICONS)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -34,9 +34,6 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const ts = () => new Date().toISOString().replace('T', ' ').replace('Z', 'Z');
 const log = (...args) => console.log(`[${ts()}]`, ...args);
 
-const DISCLAIMER =
-  'Important: Not all failed tests indicate a software defect. Some failures can be caused by temporary environment issues (e.g., slow response times, network instability, third-party outages, or test runner constraints) and may require a rerun to confirm.';
-
 function qaseHeaders() {
   return {
     'Content-Type': 'application/json',
@@ -49,8 +46,7 @@ function findFirstUrlDeep(value, matcher, depth = 0) {
 
   if (typeof value === 'string') {
     const trimmed = value.trim();
-    if (matcher.test(trimmed)) return trimmed;
-    return null;
+    return matcher.test(trimmed) ? trimmed : null;
   }
 
   if (Array.isArray(value)) {
@@ -124,9 +120,9 @@ function extractQasePublicReportUrl(payload) {
   return findFirstUrlDeep(payload, /^https:\/\/app\.qase\.io\/public\/report\//i);
 }
 
-function formatQaseReportLine(reportLink, label = 'Qase public report') {
+function formatReportLine(reportLink) {
   if (!reportLink) return '';
-  return `*${label}:* <${reportLink}|Open report>\n\n`;
+  return `*Automation Test Run Report:* <${reportLink}|Open report>\n\n`;
 }
 
 // Denmark date (DD/MM/YYYY) + English "Week X"
@@ -167,6 +163,7 @@ function formatRunDateDenmarkWithWeek() {
 
 async function qaseGet(path) {
   const url = `${QASE_BASE}${path}`;
+
   const res = await fetch(url, {
     method: 'GET',
     headers: qaseHeaders(),
@@ -285,20 +282,20 @@ function normalizeStatus(raw) {
 }
 
 function statusEmoji(status) {
-  if (status === STATUS.PASSED) return ':white_check_mark:';
-  if (status === STATUS.FAILED) return ':x:';
-  if (status === STATUS.FLAKY) return ':warning:';
-  if (status === STATUS.SKIPPED) return ':arrow_right:';
-  if (status === STATUS.INVALID) return ':question:';
-  return ':no_entry_sign:';
+  if (status === STATUS.PASSED) return '✅';
+  if (status === STATUS.FAILED) return '❌';
+  if (status === STATUS.FLAKY) return '⚠️';
+  if (status === STATUS.SKIPPED) return '↪️';
+  if (status === STATUS.INVALID) return '❓';
+  return '⛔';
 }
 
 function statusRank(s) {
   if (s === STATUS.FAILED) return 0;
   if (s === STATUS.INVALID) return 1;
   if (s === STATUS.BLOCKED) return 2;
-  if (s === STATUS.SKIPPED) return 3;
-  if (s === STATUS.FLAKY) return 4;
+  if (s === STATUS.FLAKY) return 3;
+  if (s === STATUS.SKIPPED) return 4;
   return 5;
 }
 
@@ -686,6 +683,67 @@ function combineStatus(existing, incoming) {
   return statusRank(inc) < statusRank(ex) ? incoming : existing;
 }
 
+function buildSlackMessage({
+  projectCode,
+  runId,
+  reportLink,
+  counts,
+  lines,
+}) {
+  const total = lines.length;
+  const passed = counts.passed;
+  const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
+
+  const hasFailedLike =
+    counts.failed > 0 ||
+    counts.invalid > 0 ||
+    counts.blocked > 0;
+
+  const hasFlaky = counts.flaky > 0;
+
+  let statusText;
+
+  if (hasFailedLike) {
+    statusText = '❌ Attention required';
+  } else if (hasFlaky) {
+    statusText = '⚠️ Passed with warnings';
+  } else {
+    statusText = '✅ Passed';
+  }
+
+  const importantLines = lines.filter((l) =>
+    [STATUS.FAILED, STATUS.FLAKY, STATUS.BLOCKED, STATUS.INVALID].includes(l.status)
+  );
+
+  const attentionSummary =
+    importantLines.length > 0
+      ? `*Tests requiring attention:*\n${importantLines
+          .map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`)
+          .join('\n')}`
+      : `All test cases passed successfully.`;
+
+  const disclaimer =
+    'Important: Not all failed tests indicate a software defect. Some failures can be caused by temporary environment issues, slow response times, network instability, third-party outages, or test runner constraints and may require a rerun to confirm.';
+
+  return (
+    `*Automation Regression Tests*\n\n` +
+    formatReportLine(reportLink) +
+    `Project: *${projectCode}* | Run: *${runId}*\n` +
+    `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
+    `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
+    `*Status:* ${statusText}\n` +
+    `*Result:* ${passed}/${total} tests passed — ${passRate}%\n\n` +
+    `*Test status overview:*\n` +
+    `✅ Passed: *${counts.passed}*\n` +
+    `❌ Failed: *${counts.failed}*\n` +
+    `⚠️ Flaky: *${counts.flaky}*\n` +
+    `↪️ Skipped: *${counts.skipped}*\n` +
+    `⛔ Blocked: *${counts.blocked}*\n\n` +
+    `_${disclaimer}_\n\n` +
+    attentionSummary
+  );
+}
+
 /* ---------------- processing queue-safe per runId ---------------- */
 
 const processingByRunId = new Map();
@@ -699,7 +757,6 @@ async function processRunCompleted(projectCode, runId) {
   const p = (async () => {
     const privateRunLink = `https://app.qase.io/run/${projectCode}/dashboard/${runId}`;
     let qaseReportLink = privateRunLink;
-    let qaseReportLabel = 'Qase run';
 
     log(`[QASE] Run completed: ${runId}`);
 
@@ -710,7 +767,6 @@ async function processRunCompleted(projectCode, runId) {
 
     if (publicRunLink) {
       qaseReportLink = publicRunLink;
-      qaseReportLabel = 'Qase public report';
       log(`[QASE] Public report link: ${publicRunLink}`);
     } else {
       log(`[QASE] Falling back to private run link: ${privateRunLink}`);
@@ -761,10 +817,11 @@ async function processRunCompleted(projectCode, runId) {
       await sendToSlack({
         text:
           `*Automation Regression Tests*\n\n` +
-          formatQaseReportLine(qaseReportLink, qaseReportLabel) +
-          `Project: *${projectCode}*\n` +
+          formatReportLine(qaseReportLink) +
+          `Project: *${projectCode}* | Run: *${runId}*\n` +
           `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
           `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
+          `*Status:* ⚠️ No results returned\n\n` +
           `No results returned from Qase API.`,
       });
 
@@ -852,18 +909,16 @@ async function processRunCompleted(projectCode, runId) {
 
     lines.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
 
+    const slackText = buildSlackMessage({
+      projectCode,
+      runId,
+      reportLink: qaseReportLink,
+      counts,
+      lines,
+    });
+
     await sendToSlack({
-      text:
-        `*Automation Regression Tests*\n\n` +
-        formatQaseReportLine(qaseReportLink, qaseReportLabel) +
-        `Project: *${projectCode}* | Run: *${runId}*\n` +
-        `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
-        `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
-        `Passed: *${counts.passed}* | Failed: *${counts.failed}* | Flaky: *${counts.flaky}* | ` +
-        `Skipped: *${counts.skipped}* | Blocked: *${counts.blocked}* | Invalid: *${counts.invalid}*\n\n` +
-        `_${DISCLAIMER}_\n\n` +
-        `*Test case results (${lines.length}):*\n` +
-        lines.map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`).join('\n'),
+      text: slackText,
     });
 
     log(`[DONE] Run ${runId} processed. lines=${lines.length}`);
