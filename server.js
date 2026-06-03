@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v22 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + QASE REPORT LINK)';
+  'QASE->SLACK v23 (VERCEL SAFE + SINGLE MESSAGE + SUMMARY + QASE PUBLIC REPORT LINK FALLBACK)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -44,9 +44,75 @@ function qaseHeaders() {
   };
 }
 
-function formatQaseReportLine(runLink) {
-  if (!runLink) return '';
-  return `*Test run report:* ${runLink}\n\n`;
+function findFirstUrlDeep(value, matcher, depth = 0) {
+  if (depth > 8 || value === null || value === undefined) return null;
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (matcher.test(trimmed)) return trimmed;
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFirstUrlDeep(item, matcher, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof value === 'object') {
+    for (const key of Object.keys(value)) {
+      const found = findFirstUrlDeep(value[key], matcher, depth + 1);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+function extractQasePublicReportUrl(runMeta) {
+  if (!runMeta || typeof runMeta !== 'object') return null;
+
+  const directCandidates = [
+    runMeta.public_report_url,
+    runMeta.publicReportUrl,
+    runMeta.public_url,
+    runMeta.publicUrl,
+    runMeta.report_url,
+    runMeta.reportUrl,
+    runMeta.share_url,
+    runMeta.shareUrl,
+    runMeta.shared_url,
+    runMeta.sharedUrl,
+    runMeta.public_link,
+    runMeta.publicLink,
+    runMeta.report?.public_url,
+    runMeta.report?.publicUrl,
+    runMeta.report?.url,
+    runMeta.share?.url,
+    runMeta.public?.url,
+  ];
+
+  for (const candidate of directCandidates) {
+    if (
+      typeof candidate === 'string' &&
+      /^https:\/\/app\.qase\.io\/public\/report\//i.test(candidate.trim())
+    ) {
+      return candidate.trim();
+    }
+  }
+
+  return findFirstUrlDeep(
+    runMeta,
+    /^https:\/\/app\.qase\.io\/public\/report\//i
+  );
+}
+
+function formatQaseReportLine(reportLink, label = 'Qase report') {
+  if (!reportLink) return '';
+
+  return `*${label}:* <${reportLink}|Open report>\n\n`;
 }
 
 // Denmark date (DD/MM/YYYY) + English "Week X"
@@ -573,13 +639,28 @@ async function processRunCompleted(projectCode, runId) {
   }
 
   const p = (async () => {
-    const runLink = `https://app.qase.io/run/${projectCode}/dashboard/${runId}`;
+    const privateRunLink = `https://app.qase.io/run/${projectCode}/dashboard/${runId}`;
+    let qaseReportLink = privateRunLink;
+    let qaseReportLabel = 'Qase run';
+
     log(`[QASE] Run completed: ${runId}`);
 
     const runMeta = await fetchRunMeta(runId).catch((e) => {
       log(`[QASE] Failed to fetch run meta: ${e.message}`);
       return null;
     });
+
+    log('[QASE] Run meta preview:', JSON.stringify(runMeta, null, 2).slice(0, 4000));
+
+    const publicReportLink = extractQasePublicReportUrl(runMeta);
+
+    if (publicReportLink) {
+      qaseReportLink = publicReportLink;
+      qaseReportLabel = 'Qase public report';
+      log(`[QASE] Public report link found: ${publicReportLink}`);
+    } else {
+      log(`[QASE] Public report link not found in run meta. Falling back to private run link: ${privateRunLink}`);
+    }
 
     let startedAtUnix = 0;
     if (runMeta?.start_time && typeof runMeta.start_time === 'string') {
@@ -618,7 +699,7 @@ async function processRunCompleted(projectCode, runId) {
       await sendToSlack({
         text:
           `*Automation Regression Tests*\n\n` +
-          formatQaseReportLine(runLink) +
+          formatQaseReportLine(qaseReportLink, qaseReportLabel) +
           `Project: *${projectCode}*\n` +
           `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
           `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
@@ -707,7 +788,7 @@ async function processRunCompleted(projectCode, runId) {
     await sendToSlack({
       text:
         `*Automation Regression Tests*\n\n` +
-        formatQaseReportLine(runLink) +
+        formatQaseReportLine(qaseReportLink, qaseReportLabel) +
         `Project: *${projectCode}* | Run: *${runId}*\n` +
         `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
         `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
