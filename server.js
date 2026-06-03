@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v27 (PUBLIC REPORT + STATUS OVERVIEW + FAILED TEST BROWSER)';
+  'QASE->SLACK v28 (PUBLIC REPORT + STATUS OVERVIEW + IMPROVED BROWSER DETECTION)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -316,49 +316,137 @@ function extractCaseId(r) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function normalizeBrowserName(value) {
+  if (!value) return null;
+
+  const s = String(value).trim();
+
+  if (/chromium/i.test(s)) return 'Chrome';
+  if (/chrome/i.test(s)) return 'Chrome';
+  if (/msedge|edge/i.test(s)) return 'Edge';
+  if (/firefox/i.test(s)) return 'Firefox';
+  if (/webkit/i.test(s)) return 'Safari';
+  if (/safari/i.test(s)) return 'Safari';
+  if (/mobile/i.test(s)) return 'Mobile';
+
+  return null;
+}
+
+function findBrowserDeep(value, depth = 0) {
+  if (depth > 8 || value === null || value === undefined) return null;
+
+  if (typeof value === 'string' || typeof value === 'number') {
+    return normalizeBrowserName(value);
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findBrowserDeep(item, depth + 1);
+      if (found) return found;
+    }
+
+    return null;
+  }
+
+  if (typeof value === 'object') {
+    const priorityKeys = [
+      'browser',
+      'Browser',
+      'browserName',
+      'browser_name',
+      'project',
+      'Project',
+      'projectName',
+      'project_name',
+      'device',
+      'Device',
+      'platform',
+      'environment',
+      'env',
+      'metadata',
+      'params',
+      'param',
+      'parameters',
+      'fields',
+      'custom_fields',
+      'properties',
+    ];
+
+    for (const key of priorityKeys) {
+      if (value[key]) {
+        const found = findBrowserDeep(value[key], depth + 1);
+        if (found) return found;
+      }
+    }
+
+    for (const key of Object.keys(value)) {
+      const found = findBrowserDeep(value[key], depth + 1);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
 function getResultBrowser(r) {
-  const param = r?.param || r?.params || r?.parameters;
+  const directCandidates = [
+    r?.browser,
+    r?.browserName,
+    r?.browser_name,
+    r?.project,
+    r?.projectName,
+    r?.project_name,
+    r?.environment,
+    r?.env,
+    r?.platform,
 
-  if (typeof param === 'object' && param) {
-    const browserFromParam =
-      param.browser ||
-      param.Browser ||
-      param.project ||
-      param.Project ||
-      param.device ||
-      param.Device;
+    r?.metadata?.browser,
+    r?.metadata?.browserName,
+    r?.metadata?.browser_name,
+    r?.metadata?.project,
+    r?.metadata?.projectName,
+    r?.metadata?.project_name,
+    r?.metadata?.environment,
+    r?.metadata?.env,
+    r?.metadata?.platform,
 
-    if (browserFromParam) return String(browserFromParam);
+    r?.param,
+    r?.params,
+    r?.parameters,
+    r?.fields,
+    r?.custom_fields,
+    r?.properties,
+    r?.metadata,
+
+    r?.case?.title,
+    r?.case_title,
+    r?.testcase_title,
+    r?.test_title,
+    r?.test?.title,
+    r?.test?.name,
+    r?.title,
+    r?.name,
+    r?.automation?.title,
+
+    r?.comment,
+    r?.stacktrace,
+  ];
+
+  for (const candidate of directCandidates) {
+    const found = findBrowserDeep(candidate);
+    if (found) return found;
   }
 
-  if (typeof param === 'string') {
-    const match = param.match(/chrome|edge|firefox|safari|webkit|mobile/i);
-    if (match) return match[0];
-  }
-
-  return (
-    r?.browser ||
-    r?.metadata?.browser ||
-    r?.environment ||
-    r?.metadata?.env ||
-    r?.env ||
-    r?.platform ||
-    null
-  );
+  return null;
 }
 
 function resultSuffix(r) {
   const bits = [];
 
   const param = r?.param || r?.params || r?.parameters;
-  const browser = getResultBrowser(r);
-
-  if (browser) {
-    bits.push(`Browser: ${browser}`);
-  }
 
   if (param && typeof param === 'string') {
-    if (!/chrome|edge|firefox|safari|webkit|mobile|browser/i.test(param)) {
+    if (!/chrome|chromium|edge|firefox|safari|webkit|mobile|browser/i.test(param)) {
       bits.push(param);
     }
   }
@@ -368,21 +456,23 @@ function resultSuffix(r) {
 
     delete cleanParam.browser;
     delete cleanParam.Browser;
+    delete cleanParam.browserName;
+    delete cleanParam.browser_name;
     delete cleanParam.project;
     delete cleanParam.Project;
+    delete cleanParam.projectName;
+    delete cleanParam.project_name;
     delete cleanParam.device;
     delete cleanParam.Device;
+    delete cleanParam.platform;
+    delete cleanParam.environment;
+    delete cleanParam.env;
 
     const s = JSON.stringify(cleanParam);
 
     if (s && s !== '{}' && s !== 'null') {
       bits.push(s);
     }
-  }
-
-  const env = r?.environment || r?.metadata?.env;
-  if (env && env !== browser) {
-    bits.push(env);
   }
 
   const suffix = bits.filter(Boolean).join(' | ').trim();
@@ -737,7 +827,6 @@ function combineStatus(existing, incoming) {
 
 function buildSlackMessage({
   projectCode,
-  runId,
   reportLink,
   counts,
   lines,
@@ -780,7 +869,7 @@ function buildSlackMessage({
   return (
     `*Automation Regression Tests*\n\n` +
     formatReportLine(reportLink) +
-    `Project: *${projectCode}* | Run: *${runId}*\n` +
+    `Project: *${projectCode}*\n` +
     `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
     `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
     `*Status:* ${statusText}\n` +
@@ -870,7 +959,7 @@ async function processRunCompleted(projectCode, runId) {
         text:
           `*Automation Regression Tests*\n\n` +
           formatReportLine(qaseReportLink) +
-          `Project: *${projectCode}* | Run: *${runId}*\n` +
+          `Project: *${projectCode}*\n` +
           `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
           `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
           `*Status:* ⚠️ No results returned\n\n` +
@@ -976,7 +1065,6 @@ async function processRunCompleted(projectCode, runId) {
 
     const slackText = buildSlackMessage({
       projectCode,
-      runId,
       reportLink: qaseReportLink,
       counts,
       lines,
