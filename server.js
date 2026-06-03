@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const VERSION =
-  'QASE->SLACK v28 (PUBLIC REPORT + STATUS OVERVIEW + IMPROVED BROWSER DETECTION)';
+  'QASE->SLACK v29 (PUBLIC REPORT + CLEAN STATUS OVERVIEW NO BROWSER PER TEST)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -299,7 +299,7 @@ function statusRank(s) {
   return 5;
 }
 
-/* ---------------- TITLE / BROWSER helpers ---------------- */
+/* ---------------- TITLE helpers ---------------- */
 
 function extractCaseId(r) {
   const v =
@@ -314,130 +314,6 @@ function extractCaseId(r) {
 
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : null;
-}
-
-function normalizeBrowserName(value) {
-  if (!value) return null;
-
-  const s = String(value).trim();
-
-  if (/chromium/i.test(s)) return 'Chrome';
-  if (/chrome/i.test(s)) return 'Chrome';
-  if (/msedge|edge/i.test(s)) return 'Edge';
-  if (/firefox/i.test(s)) return 'Firefox';
-  if (/webkit/i.test(s)) return 'Safari';
-  if (/safari/i.test(s)) return 'Safari';
-  if (/mobile/i.test(s)) return 'Mobile';
-
-  return null;
-}
-
-function findBrowserDeep(value, depth = 0) {
-  if (depth > 8 || value === null || value === undefined) return null;
-
-  if (typeof value === 'string' || typeof value === 'number') {
-    return normalizeBrowserName(value);
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findBrowserDeep(item, depth + 1);
-      if (found) return found;
-    }
-
-    return null;
-  }
-
-  if (typeof value === 'object') {
-    const priorityKeys = [
-      'browser',
-      'Browser',
-      'browserName',
-      'browser_name',
-      'project',
-      'Project',
-      'projectName',
-      'project_name',
-      'device',
-      'Device',
-      'platform',
-      'environment',
-      'env',
-      'metadata',
-      'params',
-      'param',
-      'parameters',
-      'fields',
-      'custom_fields',
-      'properties',
-    ];
-
-    for (const key of priorityKeys) {
-      if (value[key]) {
-        const found = findBrowserDeep(value[key], depth + 1);
-        if (found) return found;
-      }
-    }
-
-    for (const key of Object.keys(value)) {
-      const found = findBrowserDeep(value[key], depth + 1);
-      if (found) return found;
-    }
-  }
-
-  return null;
-}
-
-function getResultBrowser(r) {
-  const directCandidates = [
-    r?.browser,
-    r?.browserName,
-    r?.browser_name,
-    r?.project,
-    r?.projectName,
-    r?.project_name,
-    r?.environment,
-    r?.env,
-    r?.platform,
-
-    r?.metadata?.browser,
-    r?.metadata?.browserName,
-    r?.metadata?.browser_name,
-    r?.metadata?.project,
-    r?.metadata?.projectName,
-    r?.metadata?.project_name,
-    r?.metadata?.environment,
-    r?.metadata?.env,
-    r?.metadata?.platform,
-
-    r?.param,
-    r?.params,
-    r?.parameters,
-    r?.fields,
-    r?.custom_fields,
-    r?.properties,
-    r?.metadata,
-
-    r?.case?.title,
-    r?.case_title,
-    r?.testcase_title,
-    r?.test_title,
-    r?.test?.title,
-    r?.test?.name,
-    r?.title,
-    r?.name,
-    r?.automation?.title,
-
-    r?.comment,
-    r?.stacktrace,
-  ];
-
-  for (const candidate of directCandidates) {
-    const found = findBrowserDeep(candidate);
-    if (found) return found;
-  }
-
-  return null;
 }
 
 function resultSuffix(r) {
@@ -790,11 +666,10 @@ function mergeKeyForResult(r) {
   if (r?.id) return `id:${r.id}`;
 
   const title = bestTitleFromResult(r) || 'unknown';
-  const browser = getResultBrowser(r) || '';
   const env = r?.environment || r?.metadata?.env || '';
   const param = typeof r?.param === 'string' ? r.param : '';
 
-  return `title:${title}|browser:${browser}|env:${env}|param:${param}`;
+  return `title:${title}|env:${env}|param:${param}`;
 }
 
 function pickBetterTitle(a, b) {
@@ -859,7 +734,7 @@ function buildSlackMessage({
   const attentionSummary =
     importantLines.length > 0
       ? `*Tests requiring attention:*\n${importantLines
-          .map((l) => `${statusEmoji(l.status)} ${l.title} — Browser: *${l.browser || 'Unknown'}* — *${l.status}*`)
+          .map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`)
           .join('\n')}`
       : `All test cases passed successfully.`;
 
@@ -1004,7 +879,6 @@ async function processRunCompleted(projectCode, runId) {
       const urlFromTitle = snapshotIdToUrl(title);
       if (urlFromTitle) title = formatVisualTitleFromUrl(urlFromTitle);
 
-      const browser = getResultBrowser(r) || 'Unknown';
       const titleWithSuffix = `${title}${resultSuffix(r)}`;
 
       const key = mergeKeyForResult(r);
@@ -1014,20 +888,14 @@ async function processRunCompleted(projectCode, runId) {
         aggregated.set(key, {
           title: titleWithSuffix,
           status,
-          browser,
         });
       } else {
         const mergedStatus = combineStatus(existing.status, status);
         const betterTitle = pickBetterTitle(existing.title, titleWithSuffix);
-        const betterBrowser =
-          existing.browser && existing.browser !== 'Unknown'
-            ? existing.browser
-            : browser;
 
         aggregated.set(key, {
           title: betterTitle,
           status: mergedStatus,
-          browser: betterBrowser,
         });
       }
     }
