@@ -2,26 +2,24 @@
  * server.js
  * Qase Webhooks -> Slack
  *
- * Vercel-safe version:
- * - Waits for processing before returning 200 on /qase/webhook
- * - Exports Express app for serverless deployment
- * - Still supports local run with app.listen(...)
+ * Fixes:
+ * - Fetches Qase results directly by run id using ?run=<runId>
+ * - Counts raw test executions for Slack result totals
+ * - Keeps attention list grouped by unique test case
+ * - Does not send misleading Slack message when Qase API returns no results
+ * - Vercel-safe: waits for processing before returning 200
  */
 
 require('dotenv').config();
+
 const express = require('express');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION =
-  'QASE->SLACK v30 (RAW EXECUTION COUNT + GROUPED ATTENTION LIST)';
+const VERSION = 'QASE->SLACK v31 (FETCH RESULTS BY RUN ID + RAW EXECUTION COUNT)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
-
-function missingEnvs() {
-  return REQUIRED_ENVS.filter((k) => !process.env[k] || String(process.env[k]).trim() === '');
-}
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const QASE_API_TOKEN = process.env.QASE_API_TOKEN;
@@ -29,10 +27,29 @@ const QASE_PROJECT_CODE = process.env.QASE_PROJECT_CODE;
 const PORT = Number(process.env.PORT || 3000);
 
 const QASE_BASE = 'https://api.qase.io/v1';
+
+const STATUS = {
+  PASSED: 'passed',
+  FAILED: 'failed',
+  FLAKY: 'flaky',
+  SKIPPED: 'skipped',
+  BLOCKED: 'blocked',
+  INVALID: 'invalid',
+};
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const ts = () => new Date().toISOString().replace('T', ' ').replace('Z', 'Z');
-const log = (...args) => console.log(`[${ts()}]`, ...args);
+
+const log = (...args) => {
+  console.log(`[${ts()}]`, ...args);
+};
+
+function missingEnvs() {
+  return REQUIRED_ENVS.filter((key) => {
+    return !process.env[key] || String(process.env[key]).trim() === '';
+  });
+}
 
 function qaseHeaders() {
   return {
@@ -41,8 +58,12 @@ function qaseHeaders() {
   };
 }
 
+/* ---------------- URL / REPORT HELPERS ---------------- */
+
 function findFirstUrlDeep(value, matcher, depth = 0) {
-  if (depth > 8 || value === null || value === undefined) return null;
+  if (depth > 8 || value === null || value === undefined) {
+    return null;
+  }
 
   if (typeof value === 'string') {
     const trimmed = value.trim();
@@ -52,15 +73,22 @@ function findFirstUrlDeep(value, matcher, depth = 0) {
   if (Array.isArray(value)) {
     for (const item of value) {
       const found = findFirstUrlDeep(item, matcher, depth + 1);
-      if (found) return found;
+
+      if (found) {
+        return found;
+      }
     }
+
     return null;
   }
 
   if (typeof value === 'object') {
     for (const key of Object.keys(value)) {
       const found = findFirstUrlDeep(value[key], matcher, depth + 1);
-      if (found) return found;
+
+      if (found) {
+        return found;
+      }
     }
   }
 
@@ -68,7 +96,9 @@ function findFirstUrlDeep(value, matcher, depth = 0) {
 }
 
 function extractQasePublicReportUrl(payload) {
-  if (!payload || typeof payload !== 'object') return null;
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
 
   const directCandidates = [
     payload.public_report_url,
@@ -121,13 +151,13 @@ function extractQasePublicReportUrl(payload) {
 }
 
 function formatReportLine(reportLink) {
-  if (!reportLink) return '';
+  if (!reportLink) {
+    return '';
+  }
+
   return `*Automation Test Run Report:* <${reportLink}|Open report>\n\n`;
 }
 
-/**
- * Denmark date DD/MM/YYYY + ISO week number.
- */
 function formatRunDateDenmarkWithWeek() {
   const now = new Date();
 
@@ -138,9 +168,10 @@ function formatRunDateDenmarkWithWeek() {
     year: 'numeric',
   }).formatToParts(now);
 
-  const dd = partsDate.find((p) => p.type === 'day')?.value;
-  const mm = partsDate.find((p) => p.type === 'month')?.value;
-  const yyyy = partsDate.find((p) => p.type === 'year')?.value;
+  const dd = partsDate.find((part) => part.type === 'day')?.value;
+  const mm = partsDate.find((part) => part.type === 'month')?.value;
+  const yyyy = partsDate.find((part) => part.type === 'year')?.value;
+
   const date = `${dd}/${mm}/${yyyy}`;
 
   const partsYMD = new Intl.DateTimeFormat('en-CA', {
@@ -150,9 +181,9 @@ function formatRunDateDenmarkWithWeek() {
     day: '2-digit',
   }).formatToParts(now);
 
-  const y = Number(partsYMD.find((p) => p.type === 'year')?.value);
-  const m = Number(partsYMD.find((p) => p.type === 'month')?.value);
-  const d = Number(partsYMD.find((p) => p.type === 'day')?.value);
+  const y = Number(partsYMD.find((part) => part.type === 'year')?.value);
+  const m = Number(partsYMD.find((part) => part.type === 'month')?.value);
+  const d = Number(partsYMD.find((part) => part.type === 'day')?.value);
 
   const dt = new Date(Date.UTC(y, m - 1, d));
   const day = dt.getUTCDay() || 7;
@@ -165,8 +196,12 @@ function formatRunDateDenmarkWithWeek() {
   return `${date} - Week ${week}`;
 }
 
+/* ---------------- QASE API ---------------- */
+
 async function qaseGet(path) {
   const url = `${QASE_BASE}${path}`;
+
+  log(`[QASE] GET ${path}`);
 
   const res = await fetch(url, {
     method: 'GET',
@@ -176,8 +211,8 @@ async function qaseGet(path) {
   const json = await res.json().catch(() => null);
 
   if (!res.ok) {
-    const msg = json?.errorMessage || json?.message || json?.error || `HTTP ${res.status}`;
-    const err = new Error(msg);
+    const message = json?.errorMessage || json?.message || json?.error || `HTTP ${res.status}`;
+    const err = new Error(message);
 
     err.status = res.status;
     err.body = json;
@@ -205,8 +240,8 @@ async function makeRunPublic(projectCode, runId) {
   const json = await res.json().catch(() => null);
 
   if (!res.ok) {
-    const msg = json?.errorMessage || json?.message || json?.error || `HTTP ${res.status}`;
-    const err = new Error(msg);
+    const message = json?.errorMessage || json?.message || json?.error || `HTTP ${res.status}`;
+    const err = new Error(message);
 
     err.status = res.status;
     err.body = json;
@@ -227,19 +262,140 @@ async function makeRunPublic(projectCode, runId) {
   return publicUrl;
 }
 
-/* ---------------- STATUS ---------------- */
+async function fetchRunMeta(runId) {
+  const path = `/run/${encodeURIComponent(QASE_PROJECT_CODE)}/${encodeURIComponent(
+    runId
+  )}?include=cases`;
 
-const STATUS = {
-  PASSED: 'passed',
-  FAILED: 'failed',
-  FLAKY: 'flaky',
-  SKIPPED: 'skipped',
-  BLOCKED: 'blocked',
-  INVALID: 'invalid',
-};
+  const json = await qaseGet(path);
+
+  return json?.result || null;
+}
+
+async function fetchAllResultsPage(limit, offset, runId) {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+
+  if (runId) {
+    params.set('run', String(runId));
+  }
+
+  const path = `/result/${encodeURIComponent(QASE_PROJECT_CODE)}?${params.toString()}`;
+  const json = await qaseGet(path);
+
+  return json?.result || null;
+}
+
+async function fetchResultsForRunStrict(runId, _startedAtUnix, options = {}) {
+  const {
+    limit = 100,
+    maxPages = 30,
+    maxAttempts = 30,
+    waitMs = 10000,
+  } = options;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    log(`[QASE] Fetch attempt ${attempt}/${maxAttempts} for run ${runId}...`);
+
+    let offset = 0;
+    let pages = 0;
+    const collected = [];
+
+    while (pages < maxPages) {
+      pages++;
+
+      log(
+        `[QASE] Page ${pages}/${maxPages} for run=${runId}, limit=${limit}, offset=${offset}...`
+      );
+
+      const page = await fetchAllResultsPage(limit, offset, runId);
+      const entities = Array.isArray(page?.entities) ? page.entities : [];
+
+      log(`[QASE] Page ${pages} returned ${entities.length} entities.`);
+
+      if (!entities.length) {
+        break;
+      }
+
+      collected.push(...entities);
+
+      if (entities.length < limit) {
+        break;
+      }
+
+      offset += limit;
+    }
+
+    if (collected.length) {
+      const seen = new Set();
+      const unique = [];
+
+      for (const result of collected) {
+        const key =
+          result.id ??
+          result.hash ??
+          `${result.run_id || result.runId || result.run?.id || runId}:${
+            extractCaseId(result) || 'nocase'
+          }:${String(result.status ?? result.status_id ?? result.statusId ?? '')}:${
+            result.end_time || result.created || result.created_at || result.hash || ''
+          }`;
+
+        if (seen.has(key)) {
+          continue;
+        }
+
+        seen.add(key);
+        unique.push(result);
+      }
+
+      log(`[QASE] Results for run ${runId}: ${unique.length} found.`);
+
+      return unique;
+    }
+
+    log(`[QASE] No results yet for run ${runId}. Waiting ${waitMs}ms...`);
+
+    await sleep(waitMs);
+  }
+
+  log(`[QASE] No results returned for run ${runId} after polling.`);
+
+  return [];
+}
+
+const caseTitleCache = new Map();
+
+async function fetchCaseTitle(caseId) {
+  if (!caseId) {
+    return null;
+  }
+
+  if (caseTitleCache.has(caseId)) {
+    return caseTitleCache.get(caseId);
+  }
+
+  const json = await qaseGet(
+    `/case/${encodeURIComponent(QASE_PROJECT_CODE)}/${encodeURIComponent(caseId)}`
+  );
+
+  const title =
+    json?.result?.title && String(json.result.title).trim()
+      ? String(json.result.title).trim()
+      : `Case #${caseId}`;
+
+  caseTitleCache.set(caseId, title);
+
+  return title;
+}
+
+/* ---------------- STATUS HELPERS ---------------- */
 
 function normalizeStatus(raw) {
-  if (raw === null || raw === undefined) return STATUS.BLOCKED;
+  if (raw === null || raw === undefined) {
+    return STATUS.BLOCKED;
+  }
 
   if (typeof raw === 'object') {
     const candidate =
@@ -272,24 +428,29 @@ function normalizeStatus(raw) {
     return STATUS.BLOCKED;
   }
 
-  const s = String(raw).toLowerCase().trim();
+  const status = String(raw).toLowerCase().trim();
 
-  if (s === 'passed' || s === 'pass') return STATUS.PASSED;
-  if (s === 'failed' || s === 'fail') return STATUS.FAILED;
-  if (s === 'flaky' || s === 'unstable') return STATUS.FLAKY;
-  if (s === 'skipped' || s === 'skiped' || s === 'skip' || s === 'untested') {
+  if (status === 'passed' || status === 'pass') return STATUS.PASSED;
+  if (status === 'failed' || status === 'fail') return STATUS.FAILED;
+  if (status === 'flaky' || status === 'unstable') return STATUS.FLAKY;
+  if (
+    status === 'skipped' ||
+    status === 'skiped' ||
+    status === 'skip' ||
+    status === 'untested'
+  ) {
     return STATUS.SKIPPED;
   }
-  if (s === 'invalid') return STATUS.INVALID;
+  if (status === 'invalid') return STATUS.INVALID;
 
   if (
-    s === 'blocked' ||
-    s.includes('block') ||
-    s.includes('cancel') ||
-    s.includes('abort') ||
-    s.includes('queue') ||
-    s.includes('progress') ||
-    s === 'running'
+    status === 'blocked' ||
+    status.includes('block') ||
+    status.includes('cancel') ||
+    status.includes('abort') ||
+    status.includes('queue') ||
+    status.includes('progress') ||
+    status === 'running'
   ) {
     return STATUS.BLOCKED;
   }
@@ -307,38 +468,37 @@ function statusEmoji(status) {
   return '⛔';
 }
 
-function statusRank(s) {
-  if (s === STATUS.FAILED) return 0;
-  if (s === STATUS.INVALID) return 1;
-  if (s === STATUS.BLOCKED) return 2;
-  if (s === STATUS.FLAKY) return 3;
-  if (s === STATUS.SKIPPED) return 4;
+function statusRank(status) {
+  if (status === STATUS.FAILED) return 0;
+  if (status === STATUS.INVALID) return 1;
+  if (status === STATUS.BLOCKED) return 2;
+  if (status === STATUS.FLAKY) return 3;
+  if (status === STATUS.SKIPPED) return 4;
 
   return 5;
 }
 
-/* ---------------- TITLE helpers ---------------- */
+/* ---------------- TITLE HELPERS ---------------- */
 
-function extractCaseId(r) {
-  const v =
-    r?.case_id ??
-    r?.caseId ??
-    r?.case?.id ??
-    r?.case?.case_id ??
-    r?.testcase?.id ??
-    r?.testCaseId ??
-    r?.relations?.case_id ??
+function extractCaseId(result) {
+  const value =
+    result?.case_id ??
+    result?.caseId ??
+    result?.case?.id ??
+    result?.case?.case_id ??
+    result?.testcase?.id ??
+    result?.testCaseId ??
+    result?.relations?.case_id ??
     null;
 
-  const n = Number(v);
+  const id = Number(value);
 
-  return Number.isFinite(n) && n > 0 ? n : null;
+  return Number.isFinite(id) && id > 0 ? id : null;
 }
 
-function resultSuffix(r) {
+function resultSuffix(result) {
   const bits = [];
-
-  const param = r?.param || r?.params || r?.parameters;
+  const param = result?.param || result?.params || result?.parameters;
 
   if (param && typeof param === 'string') {
     if (!/chrome|chromium|edge|firefox|safari|webkit|mobile|browser/i.test(param)) {
@@ -363,10 +523,10 @@ function resultSuffix(r) {
     delete cleanParam.environment;
     delete cleanParam.env;
 
-    const s = JSON.stringify(cleanParam);
+    const serialized = JSON.stringify(cleanParam);
 
-    if (s && s !== '{}' && s !== 'null') {
-      bits.push(s);
+    if (serialized && serialized !== '{}' && serialized !== 'null') {
+      bits.push(serialized);
     }
   }
 
@@ -375,98 +535,127 @@ function resultSuffix(r) {
   return suffix ? ` — ${suffix}` : '';
 }
 
-function isBadTitle(t) {
-  const s = String(t || '').trim();
+function isBadTitle(title) {
+  const value = String(title || '').trim();
 
-  if (!s) return true;
+  if (!value) {
+    return true;
+  }
 
-  const low = s.toLowerCase();
+  const lower = value.toLowerCase();
 
   return (
-    low.startsWith('error:') ||
-    low.includes('expect(') ||
-    low.includes('tohavescreenshot') ||
-    low.includes("snapshot doesn't exist") ||
-    low.includes('compounderror') ||
-    low.includes('received:') ||
-    low.includes('expected:') ||
-    low.includes('stack trace') ||
-    low.includes('end of error message')
+    lower.startsWith('error:') ||
+    lower.includes('expect(') ||
+    lower.includes('tohavescreenshot') ||
+    lower.includes("snapshot doesn't exist") ||
+    lower.includes('compounderror') ||
+    lower.includes('received:') ||
+    lower.includes('expected:') ||
+    lower.includes('stack trace') ||
+    lower.includes('end of error message')
   );
 }
 
-function cleanupSnapshotDerivedTitle(s) {
-  let t = String(s || '').trim();
+function cleanupSnapshotDerivedTitle(value) {
+  let title = String(value || '').trim();
 
-  t = t.replace(/^.*?(?:-snapshots|__snapshots__)[/\\]/i, '');
-  t = t.replace(/\.(png|jpg|jpeg|webp)$/i, '');
-  t = t.replace(/-(chromium|firefox|webkit)(-darwin|-linux|-win32)?$/i, '');
-  t = t.replace(/\s+/g, ' ').trim();
+  title = title.replace(/^.*?(?:-snapshots|__snapshots__)[/\\]/i, '');
+  title = title.replace(/\.(png|jpg|jpeg|webp)$/i, '');
+  title = title.replace(/-(chromium|firefox|webkit)(-darwin|-linux|-win32)?$/i, '');
+  title = title.replace(/\s+/g, ' ').trim();
 
-  return t || null;
+  return title || null;
 }
 
 function snapshotIdToUrl(snapshotId) {
-  const s = String(snapshotId || '').trim();
+  const value = String(snapshotId || '').trim();
 
-  if (!s) return null;
-  if ((s.match(/_/g) || []).length < 3) return null;
+  if (!value) {
+    return null;
+  }
 
-  const parts = s.split('_');
+  if ((value.match(/_/g) || []).length < 3) {
+    return null;
+  }
 
-  if (parts.length < 4) return null;
+  const parts = value.split('_');
+
+  if (parts.length < 4) {
+    return null;
+  }
 
   const domainPart = parts[0];
   const lang = parts[1];
   const region = parts[2];
   const pathParts = parts.slice(3);
 
-  if (!/^[a-z]{2}$/i.test(lang)) return null;
-  if (!/^[a-z]{2,5}(-[a-z]{2,5})?$/i.test(region)) return null;
-  if (!/^[a-z0-9-]+$/i.test(domainPart)) return null;
+  if (!/^[a-z]{2}$/i.test(lang)) {
+    return null;
+  }
+
+  if (!/^[a-z]{2,5}(-[a-z]{2,5})?$/i.test(region)) {
+    return null;
+  }
+
+  if (!/^[a-z0-9-]+$/i.test(domainPart)) {
+    return null;
+  }
 
   const domain = domainPart.replace(/-/g, '.');
   const path = pathParts.join('_').replace(/_/g, '/');
 
-  if (!path) return null;
+  if (!path) {
+    return null;
+  }
 
   return `https://${domain}/${lang}/${region}/${path}`;
 }
 
 function formatVisualTitleFromUrl(url) {
-  if (!url) return null;
+  if (!url) {
+    return null;
+  }
 
   return `Visual Regression Test - ${url} renders correctly (entire scrollable page)`;
 }
 
 function titleFromErrorText(text) {
-  if (!text || typeof text !== 'string') return null;
-
-  const t = text.replace(/\r/g, '\n');
-
-  const vr = t.match(/(Visual Regression Test\s*-\s*[^\n]+)/i);
-
-  if (vr && vr[1]) {
-    const out = vr[1].trim().slice(0, 260);
-
-    if (out && !isBadTitle(out)) return out;
+  if (!text || typeof text !== 'string') {
+    return null;
   }
 
-  const sn = t.match(/Snapshot name:\s*([^\n]+)/i) || t.match(/Snapshot:\s*([^\n]+)/i);
+  const normalizedText = text.replace(/\r/g, '\n');
 
-  if (sn && sn[1]) {
-    const cleaned = cleanupSnapshotDerivedTitle(sn[1]);
+  const visualRegressionTitle = normalizedText.match(/(Visual Regression Test\s*-\s*[^\n]+)/i);
+
+  if (visualRegressionTitle && visualRegressionTitle[1]) {
+    const output = visualRegressionTitle[1].trim().slice(0, 260);
+
+    if (output && !isBadTitle(output)) {
+      return output;
+    }
+  }
+
+  const snapshotName =
+    normalizedText.match(/Snapshot name:\s*([^\n]+)/i) ||
+    normalizedText.match(/Snapshot:\s*([^\n]+)/i);
+
+  if (snapshotName && snapshotName[1]) {
+    const cleaned = cleanupSnapshotDerivedTitle(snapshotName[1]);
 
     if (cleaned && !isBadTitle(cleaned)) {
       const url = snapshotIdToUrl(cleaned);
 
-      if (url) return formatVisualTitleFromUrl(url);
+      if (url) {
+        return formatVisualTitleFromUrl(url);
+      }
 
       return cleaned.slice(0, 260);
     }
   }
 
-  const pathMatch = t.match(
+  const pathMatch = normalizedText.match(
     /(?:__snapshots__|[-_]snapshots)[/\\]([^\n]+?\.(png|jpg|jpeg|webp))/i
   );
 
@@ -476,7 +665,9 @@ function titleFromErrorText(text) {
     if (cleaned && !isBadTitle(cleaned)) {
       const url = snapshotIdToUrl(cleaned);
 
-      if (url) return formatVisualTitleFromUrl(url);
+      if (url) {
+        return formatVisualTitleFromUrl(url);
+      }
 
       return cleaned.slice(0, 260);
     }
@@ -485,45 +676,58 @@ function titleFromErrorText(text) {
   return null;
 }
 
-function bestTitleFromResult(r) {
+function bestTitleFromResult(result) {
   const candidates = [
-    r?.case?.title,
-    r?.case_title,
-    r?.testcase_title,
-    r?.test_title,
-    r?.test?.title,
-    r?.test?.name,
-    r?.title,
-    r?.name,
-    r?.automation?.title,
-  ].filter((x) => typeof x === 'string' && x.trim());
+    result?.case?.title,
+    result?.case_title,
+    result?.testcase_title,
+    result?.test_title,
+    result?.test?.title,
+    result?.test?.name,
+    result?.title,
+    result?.name,
+    result?.automation?.title,
+  ].filter((candidate) => typeof candidate === 'string' && candidate.trim());
 
   if (candidates.length) {
-    const c = candidates[0].trim();
-    const url = snapshotIdToUrl(c);
+    const title = candidates[0].trim();
+    const url = snapshotIdToUrl(title);
 
-    if (url) return formatVisualTitleFromUrl(url);
+    if (url) {
+      return formatVisualTitleFromUrl(url);
+    }
 
-    return c;
+    return title;
   }
 
-  const fromStack = titleFromErrorText(r?.stacktrace);
-  if (fromStack) return fromStack;
+  const fromStack = titleFromErrorText(result?.stacktrace);
 
-  const fromComment = titleFromErrorText(r?.comment);
-  if (fromComment) return fromComment;
+  if (fromStack) {
+    return fromStack;
+  }
 
-  if (r?.id) return `Test result #${r.id}`;
-  if (r?.hash) return `Test ${String(r.hash).slice(0, 10)}`;
+  const fromComment = titleFromErrorText(result?.comment);
+
+  if (fromComment) {
+    return fromComment;
+  }
+
+  if (result?.id) {
+    return `Test result #${result.id}`;
+  }
+
+  if (result?.hash) {
+    return `Test ${String(result.hash).slice(0, 10)}`;
+  }
 
   return 'Unknown test';
 }
 
-/* ---------------- Failure / flaky inference ---------------- */
+/* ---------------- FAILURE / FLAKY INFERENCE ---------------- */
 
-function inferFailedFromResult(r) {
-  const comment = typeof r?.comment === 'string' ? r.comment : '';
-  const stack = typeof r?.stacktrace === 'string' ? r.stacktrace : '';
+function inferFailedFromResult(result) {
+  const comment = typeof result?.comment === 'string' ? result.comment : '';
+  const stack = typeof result?.stacktrace === 'string' ? result.stacktrace : '';
 
   const hasErrorWord =
     /error|exception|timeout|failed|failure|compounderror|tohavescreenshot|snapshot/i.test(
@@ -535,235 +739,141 @@ function inferFailedFromResult(r) {
     /expect\(|expected:\s*\d+|received:\s*\d+|assert/i.test(comment) ||
     /expect\(|expected:\s*\d+|received:\s*\d+|assert/i.test(stack);
 
-  const hasAttachments = Array.isArray(r?.attachments) && r.attachments.length > 0;
+  const hasAttachments = Array.isArray(result?.attachments) && result.attachments.length > 0;
 
   return Boolean(hasErrorWord || hasAssertion || hasAttachments);
 }
 
-function inferFlakyFromResult(r) {
-  if (!r || typeof r !== 'object') return false;
+function inferFlakyFromResult(result) {
+  if (!result || typeof result !== 'object') {
+    return false;
+  }
 
-  if (r.is_flaky === true || r.flaky === true) return true;
+  if (result.is_flaky === true || result.flaky === true) {
+    return true;
+  }
 
   const retryCount =
-    Number(r.retries) ||
-    Number(r.retry) ||
-    Number(r.retry_count) ||
-    Number(r.retest) ||
-    Number(r.retest_count) ||
+    Number(result.retries) ||
+    Number(result.retry) ||
+    Number(result.retry_count) ||
+    Number(result.retest) ||
+    Number(result.retest_count) ||
     0;
 
   const attempts =
-    (Array.isArray(r.retries) && r.retries) ||
-    (Array.isArray(r.retry_results) && r.retry_results) ||
-    (Array.isArray(r.attempts) && r.attempts) ||
-    (Array.isArray(r.results) && r.results) ||
+    (Array.isArray(result.retries) && result.retries) ||
+    (Array.isArray(result.retry_results) && result.retry_results) ||
+    (Array.isArray(result.attempts) && result.attempts) ||
+    (Array.isArray(result.results) && result.results) ||
     [];
 
   if (attempts.length) {
     const statuses = attempts
-      .map((a) =>
-        normalizeStatus(a?.status ?? a?.status_id ?? a?.statusId ?? a?.result ?? a?.state)
-      )
+      .map((attempt) => {
+        return normalizeStatus(
+          attempt?.status ??
+            attempt?.status_id ??
+            attempt?.statusId ??
+            attempt?.result ??
+            attempt?.state
+        );
+      })
       .filter(Boolean);
 
     const hasFail = statuses.includes(STATUS.FAILED) || statuses.includes(STATUS.INVALID);
     const hasPass = statuses.includes(STATUS.PASSED);
 
-    if (hasFail && hasPass) return true;
+    if (hasFail && hasPass) {
+      return true;
+    }
   }
 
-  if (retryCount > 0) return true;
+  if (retryCount > 0) {
+    return true;
+  }
 
-  const comment = typeof r.comment === 'string' ? r.comment : '';
-  const stack = typeof r.stacktrace === 'string' ? r.stacktrace : '';
+  const comment = typeof result.comment === 'string' ? result.comment : '';
+  const stack = typeof result.stacktrace === 'string' ? result.stacktrace : '';
 
-  if (/retry|re-?run|rerun|flaky/i.test(comment) || /retry|re-?run|rerun|flaky/i.test(stack)) {
+  if (
+    /retry|re-?run|rerun|flaky/i.test(comment) ||
+    /retry|re-?run|rerun|flaky/i.test(stack)
+  ) {
     return true;
   }
 
   return false;
 }
 
-/* ---------------- Slack ---------------- */
+/* ---------------- AGGREGATION ---------------- */
 
-async function sendToSlack(payload) {
-  log('[SLACK] Sending message...');
+function mergeKeyForResult(result) {
+  const caseId = extractCaseId(result);
 
-  const res = await fetch(SLACK_WEBHOOK_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const txt = await res.text().catch(() => '');
-
-  log(`[SLACK] HTTP ${res.status} ok=${res.ok} body=${(txt || '').slice(0, 200)}`);
-
-  if (!res.ok) {
-    throw new Error(`Slack webhook failed: HTTP ${res.status}`);
-  }
-}
-
-/* ---------------- Qase ---------------- */
-
-async function fetchRunMeta(runId) {
-  const path = `/run/${encodeURIComponent(QASE_PROJECT_CODE)}/${encodeURIComponent(
-    runId
-  )}?include=cases`;
-
-  const json = await qaseGet(path);
-
-  return json?.result || null;
-}
-
-async function fetchAllResultsPage(limit, offset) {
-  const path = `/result/${encodeURIComponent(QASE_PROJECT_CODE)}?limit=${limit}&offset=${offset}`;
-  const json = await qaseGet(path);
-
-  return json?.result || null;
-}
-
-async function fetchResultsForRunStrict(runId, startedAtUnix, options = {}) {
-  const { limit = 100, maxPages = 50, maxAttempts = 8, waitMs = 3000 } = options;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    log(`[QASE] Fetch attempt ${attempt}/${maxAttempts} for run ${runId}...`);
-
-    let offset = 0;
-    let pages = 0;
-    let collected = [];
-
-    while (pages < maxPages) {
-      pages++;
-
-      log(`[QASE] Page ${pages}/${maxPages} (limit=${limit}, offset=${offset})...`);
-
-      const page = await fetchAllResultsPage(limit, offset);
-      const entities = Array.isArray(page?.entities) ? page.entities : [];
-
-      if (!entities.length) break;
-
-      const matches = entities.filter((e) => Number(e.run_id) === Number(runId));
-
-      if (matches.length) {
-        collected.push(...matches);
-      }
-
-      const hasRunMatches = collected.length > 0;
-
-      const minCreated = entities
-        .map((e) => e.created || e.created_at || e.timestamp || e.time)
-        .map((v) => Number(v))
-        .filter((v) => Number.isFinite(v) && v > 0)
-        .sort((a, b) => a - b)[0];
-
-      if (hasRunMatches && startedAtUnix && minCreated && minCreated < startedAtUnix) {
-        log('[QASE] Found run results and reached older pages. Stopping pagination.');
-        break;
-      }
-
-      offset += limit;
-    }
-
-    if (collected.length) {
-      const seen = new Set();
-      const uniq = [];
-
-      for (const r of collected) {
-        const key =
-          r.id ??
-          r.hash ??
-          `${r.run_id}:${extractCaseId(r) || 'nocase'}:${String(r.status)}:${
-            r.end_time || r.created || r.created_at || ''
-          }`;
-
-        if (seen.has(key)) continue;
-
-        seen.add(key);
-        uniq.push(r);
-      }
-
-      log(`[QASE] Results for run ${runId}: ${uniq.length} found.`);
-
-      return uniq;
-    }
-
-    log(`[QASE] No results yet for run ${runId}. Waiting ${waitMs}ms...`);
-
-    await sleep(waitMs);
+  if (caseId) {
+    return `case:${caseId}`;
   }
 
-  return [];
-}
+  if (result?.hash) {
+    return `hash:${result.hash}`;
+  }
 
-const caseTitleCache = new Map();
+  if (result?.id) {
+    return `id:${result.id}`;
+  }
 
-async function fetchCaseTitle(caseId) {
-  if (!caseId) return null;
-  if (caseTitleCache.has(caseId)) return caseTitleCache.get(caseId);
-
-  const json = await qaseGet(
-    `/case/${encodeURIComponent(QASE_PROJECT_CODE)}/${encodeURIComponent(caseId)}`
-  );
-
-  const t =
-    json?.result?.title && String(json.result.title).trim()
-      ? String(json.result.title).trim()
-      : `Case #${caseId}`;
-
-  caseTitleCache.set(caseId, t);
-
-  return t;
-}
-
-/* ---------------- Aggregation ---------------- */
-
-function mergeKeyForResult(r) {
-  const caseId = extractCaseId(r);
-
-  if (caseId) return `case:${caseId}`;
-  if (r?.hash) return `hash:${r.hash}`;
-  if (r?.id) return `id:${r.id}`;
-
-  const title = bestTitleFromResult(r) || 'unknown';
-  const env = r?.environment || r?.metadata?.env || '';
-  const param = typeof r?.param === 'string' ? r.param : '';
+  const title = bestTitleFromResult(result) || 'unknown';
+  const env = result?.environment || result?.metadata?.env || '';
+  const param = typeof result?.param === 'string' ? result.param : '';
 
   return `title:${title}|env:${env}|param:${param}`;
 }
 
-function pickBetterTitle(a, b) {
-  const aBad = isBadTitle(a);
-  const bBad = isBadTitle(b);
+function pickBetterTitle(currentTitle, incomingTitle) {
+  const currentBad = isBadTitle(currentTitle);
+  const incomingBad = isBadTitle(incomingTitle);
 
-  if (aBad && !bBad) return b;
-  if (!aBad && bBad) return a;
-
-  if (!aBad && !bBad) {
-    return String(b).length > String(a).length ? b : a;
+  if (currentBad && !incomingBad) {
+    return incomingTitle;
   }
 
-  return String(b).length < String(a).length ? b : a;
+  if (!currentBad && incomingBad) {
+    return currentTitle;
+  }
+
+  if (!currentBad && !incomingBad) {
+    return String(incomingTitle).length > String(currentTitle).length
+      ? incomingTitle
+      : currentTitle;
+  }
+
+  return String(incomingTitle).length < String(currentTitle).length
+    ? incomingTitle
+    : currentTitle;
 }
 
-function combineStatus(existing, incoming) {
-  if (!existing) return incoming;
+function combineStatus(existingStatus, incomingStatus) {
+  if (!existingStatus) {
+    return incomingStatus;
+  }
 
-  const ex = existing === STATUS.INVALID ? STATUS.FAILED : existing;
-  const inc = incoming === STATUS.INVALID ? STATUS.FAILED : incoming;
+  const existing = existingStatus === STATUS.INVALID ? STATUS.FAILED : existingStatus;
+  const incoming = incomingStatus === STATUS.INVALID ? STATUS.FAILED : incomingStatus;
 
-  if (ex === STATUS.FLAKY || inc === STATUS.FLAKY) return STATUS.FLAKY;
+  if (existing === STATUS.FLAKY || incoming === STATUS.FLAKY) {
+    return STATUS.FLAKY;
+  }
 
   const passFailCombo =
-    (ex === STATUS.PASSED && inc === STATUS.FAILED) ||
-    (ex === STATUS.FAILED && inc === STATUS.PASSED);
+    (existing === STATUS.PASSED && incoming === STATUS.FAILED) ||
+    (existing === STATUS.FAILED && incoming === STATUS.PASSED);
 
-  if (passFailCombo) return STATUS.FLAKY;
+  if (passFailCombo) {
+    return STATUS.FLAKY;
+  }
 
-  return statusRank(inc) < statusRank(ex) ? incoming : existing;
+  return statusRank(incoming) < statusRank(existing) ? incomingStatus : existingStatus;
 }
 
 function countExecutionStatuses(executionStatuses) {
@@ -799,6 +909,28 @@ function getCountsTotal(counts) {
   );
 }
 
+/* ---------------- SLACK ---------------- */
+
+async function sendToSlack(payload) {
+  log('[SLACK] Sending message...');
+
+  const res = await fetch(SLACK_WEBHOOK_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text().catch(() => '');
+
+  log(`[SLACK] HTTP ${res.status} ok=${res.ok} body=${(text || '').slice(0, 200)}`);
+
+  if (!res.ok) {
+    throw new Error(`Slack webhook failed: HTTP ${res.status}`);
+  }
+}
+
 function buildSlackMessage({
   projectCode,
   reportLink,
@@ -823,14 +955,16 @@ function buildSlackMessage({
     statusText = '✅ Passed';
   }
 
-  const importantLines = lines.filter((l) =>
-    [STATUS.FAILED, STATUS.FLAKY, STATUS.BLOCKED, STATUS.INVALID].includes(l.status)
-  );
+  const importantLines = lines.filter((line) => {
+    return [STATUS.FAILED, STATUS.FLAKY, STATUS.BLOCKED, STATUS.INVALID].includes(line.status);
+  });
 
   const attentionSummary =
     importantLines.length > 0
       ? `*Tests requiring attention:*\n${importantLines
-          .map((l) => `${statusEmoji(l.status)} ${l.title} — *${l.status}*`)
+          .map((line) => {
+            return `${statusEmoji(line.status)} ${line.title} — *${line.status}*`;
+          })
           .join('\n')}`
       : 'All test executions passed successfully.';
 
@@ -842,7 +976,7 @@ function buildSlackMessage({
     formatReportLine(reportLink) +
     `Project: *${projectCode}*\n` +
     `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
-    `Browsers: Chrome, Safari, Mobile(webkit)\n\n` +
+    `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
     `*Status:* ${statusText}\n` +
     `*Result:* ${passed}/${totalExecutions} test executions passed — ${passRate}%\n\n` +
     `*Test status overview:*\n` +
@@ -857,7 +991,7 @@ function buildSlackMessage({
   );
 }
 
-/* ---------------- Processing queue-safe per runId ---------------- */
+/* ---------------- PROCESSING ---------------- */
 
 const processingByRunId = new Map();
 
@@ -867,14 +1001,14 @@ async function processRunCompleted(projectCode, runId) {
     return processingByRunId.get(runId);
   }
 
-  const p = (async () => {
+  const processingPromise = (async () => {
     const privateRunLink = `https://app.qase.io/run/${projectCode}/dashboard/${runId}`;
     let qaseReportLink = privateRunLink;
 
     log(`[QASE] Run completed: ${runId}`);
 
-    const publicRunLink = await makeRunPublic(projectCode, runId).catch((e) => {
-      log(`[QASE] Failed to make run public: ${e.message}`);
+    const publicRunLink = await makeRunPublic(projectCode, runId).catch((err) => {
+      log(`[QASE] Failed to make run public: ${err.message}`);
       return null;
     });
 
@@ -885,8 +1019,8 @@ async function processRunCompleted(projectCode, runId) {
       log(`[QASE] Falling back to private run link: ${privateRunLink}`);
     }
 
-    const runMeta = await fetchRunMeta(runId).catch((e) => {
-      log(`[QASE] Failed to fetch run meta: ${e.message}`);
+    const runMeta = await fetchRunMeta(runId).catch((err) => {
+      log(`[QASE] Failed to fetch run meta: ${err.message}`);
       return null;
     });
 
@@ -906,9 +1040,11 @@ async function processRunCompleted(projectCode, runId) {
     const caseMap = new Map();
 
     for (const c of runCases) {
-      const cid = Number(c?.case_id ?? c?.id ?? c?.case?.id);
+      const caseId = Number(c?.case_id ?? c?.id ?? c?.case?.id);
 
-      if (!Number.isFinite(cid) || cid <= 0) continue;
+      if (!Number.isFinite(caseId) || caseId <= 0) {
+        continue;
+      }
 
       const title =
         typeof c?.title === 'string' && c.title.trim()
@@ -917,32 +1053,23 @@ async function processRunCompleted(projectCode, runId) {
             ? c.case.title.trim()
             : null;
 
-      const st = normalizeStatus(c?.status ?? c?.status_id ?? c?.result ?? c?.state);
+      const status = normalizeStatus(c?.status ?? c?.status_id ?? c?.result ?? c?.state);
 
-      caseMap.set(cid, {
+      caseMap.set(caseId, {
         title,
-        status: st,
+        status,
       });
     }
 
     const results = await fetchResultsForRunStrict(runId, startedAtUnix, {
       limit: 100,
-      maxPages: 50,
-      maxAttempts: 8,
-      waitMs: 3000,
+      maxPages: 30,
+      maxAttempts: 30,
+      waitMs: 10000,
     });
 
     if (!results.length) {
-      await sendToSlack({
-        text:
-          `*Automation Regression Tests*\n\n` +
-          formatReportLine(qaseReportLink) +
-          `Project: *${projectCode}*\n` +
-          `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
-          `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
-          `*Status:* ⚠️ No results returned\n\n` +
-          `No results returned from Qase API.`,
-      });
+      log(`[QASE] No results returned for run ${runId}. Slack notification skipped.`);
 
       return;
     }
@@ -950,12 +1077,18 @@ async function processRunCompleted(projectCode, runId) {
     const aggregated = new Map();
     const executionStatuses = [];
 
-    for (const r of results) {
-      const caseId = extractCaseId(r);
+    for (const result of results) {
+      const caseId = extractCaseId(result);
 
-      let status = normalizeStatus(r?.status ?? r?.status_id ?? r?.statusId ?? r?.result ?? r?.state);
+      let status = normalizeStatus(
+        result?.status ??
+          result?.status_id ??
+          result?.statusId ??
+          result?.result ??
+          result?.state
+      );
 
-      if (status === STATUS.INVALID && inferFailedFromResult(r)) {
+      if (status === STATUS.INVALID && inferFailedFromResult(result)) {
         status = STATUS.FAILED;
       }
 
@@ -971,7 +1104,7 @@ async function processRunCompleted(projectCode, runId) {
         }
       }
 
-      if (inferFlakyFromResult(r)) {
+      if (inferFlakyFromResult(result)) {
         status = STATUS.FLAKY;
       }
 
@@ -986,7 +1119,7 @@ async function processRunCompleted(projectCode, runId) {
           title = await fetchCaseTitle(caseId).catch(() => `Case #${caseId}`);
         }
       } else {
-        title = bestTitleFromResult(r);
+        title = bestTitleFromResult(result);
       }
 
       const urlFromTitle = snapshotIdToUrl(title);
@@ -995,8 +1128,8 @@ async function processRunCompleted(projectCode, runId) {
         title = formatVisualTitleFromUrl(urlFromTitle);
       }
 
-      const titleWithSuffix = `${title}${resultSuffix(r)}`;
-      const key = mergeKeyForResult(r);
+      const titleWithSuffix = `${title}${resultSuffix(result)}`;
+      const key = mergeKeyForResult(result);
       const existing = aggregated.get(key);
 
       if (!existing) {
@@ -1005,12 +1138,9 @@ async function processRunCompleted(projectCode, runId) {
           status,
         });
       } else {
-        const mergedStatus = combineStatus(existing.status, status);
-        const betterTitle = pickBetterTitle(existing.title, titleWithSuffix);
-
         aggregated.set(key, {
-          title: betterTitle,
-          status: mergedStatus,
+          title: pickBetterTitle(existing.title, titleWithSuffix),
+          status: combineStatus(existing.status, status),
         });
       }
     }
@@ -1026,14 +1156,16 @@ async function processRunCompleted(projectCode, runId) {
       passed: 5,
     };
 
-    lines.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+    lines.sort((a, b) => {
+      return (order[a.status] ?? 9) - (order[b.status] ?? 9);
+    });
 
     const counts = countExecutionStatuses(executionStatuses);
     const totalExecutions = getCountsTotal(counts);
     const uniqueCaseCount = lines.length;
 
     log(
-      `[QASE] Run ${runId} count summary: executions=${totalExecutions}, uniqueCases=${uniqueCaseCount}, passed=${counts.passed}, failed=${counts.failed}, flaky=${counts.flaky}, skipped=${counts.skipped}, blocked=${counts.blocked}, invalid=${counts.invalid}`
+      `[QASE] Run ${runId} summary: executions=${totalExecutions}, uniqueCases=${uniqueCaseCount}, passed=${counts.passed}, failed=${counts.failed}, flaky=${counts.flaky}, skipped=${counts.skipped}, blocked=${counts.blocked}, invalid=${counts.invalid}`
     );
 
     const slackText = buildSlackMessage({
@@ -1049,17 +1181,21 @@ async function processRunCompleted(projectCode, runId) {
       text: slackText,
     });
 
-    log(`[DONE] Run ${runId} processed. executions=${totalExecutions}, uniqueCases=${uniqueCaseCount}`);
+    log(
+      `[DONE] Run ${runId} processed. executions=${totalExecutions}, uniqueCases=${uniqueCaseCount}`
+    );
   })();
 
-  processingByRunId.set(runId, p);
+  processingByRunId.set(runId, processingPromise);
 
-  p.finally(() => processingByRunId.delete(runId));
+  processingPromise.finally(() => {
+    processingByRunId.delete(runId);
+  });
 
-  return p;
+  return processingPromise;
 }
 
-/* ---------------- Routes ---------------- */
+/* ---------------- ROUTES ---------------- */
 
 app.get('/health', (_req, res) => {
   res.status(200).send('ok');
@@ -1108,11 +1244,11 @@ app.post('/qase/webhook', async (req, res) => {
     const runId = req.body?.payload?.id;
 
     if (!runId) {
-      log('[QASE] Missing payload.id (runId).');
+      log('[QASE] Missing payload.id / runId.');
 
       return res.status(400).json({
         ok: false,
-        error: 'Missing payload.id (runId)',
+        error: 'Missing payload.id / runId',
       });
     }
 
@@ -1137,7 +1273,7 @@ app.post('/qase/webhook', async (req, res) => {
   }
 });
 
-/* ---------------- Local + export ---------------- */
+/* ---------------- LOCAL + EXPORT ---------------- */
 
 if (require.main === module) {
   log(`SLACK_WEBHOOK_URL configured: ${Boolean(SLACK_WEBHOOK_URL)}`);
