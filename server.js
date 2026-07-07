@@ -8,6 +8,7 @@
  * - Keeps attention list grouped by unique test case
  * - Does not send misleading Slack message when Qase API returns no results
  * - Vercel-safe: waits for processing before returning 200
+ * - Treats flaky tests as passed
  */
 
 require('dotenv').config();
@@ -17,7 +18,7 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'QASE->SLACK v31 (FETCH RESULTS BY RUN ID + RAW EXECUTION COUNT)';
+const VERSION = 'QASE->SLACK v32 (FLAKY COUNTS AS PASSED)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -423,7 +424,7 @@ function normalizeStatus(raw) {
     if (raw === 3) return STATUS.BLOCKED;
     if (raw === 4) return STATUS.SKIPPED;
     if (raw === 5) return STATUS.INVALID;
-    if (raw === 6) return STATUS.FLAKY;
+    if (raw === 6) return STATUS.PASSED;
 
     return STATUS.BLOCKED;
   }
@@ -432,7 +433,7 @@ function normalizeStatus(raw) {
 
   if (status === 'passed' || status === 'pass') return STATUS.PASSED;
   if (status === 'failed' || status === 'fail') return STATUS.FAILED;
-  if (status === 'flaky' || status === 'unstable') return STATUS.FLAKY;
+  if (status === 'flaky' || status === 'unstable') return STATUS.PASSED;
   if (
     status === 'skipped' ||
     status === 'skiped' ||
@@ -861,16 +862,12 @@ function combineStatus(existingStatus, incomingStatus) {
   const existing = existingStatus === STATUS.INVALID ? STATUS.FAILED : existingStatus;
   const incoming = incomingStatus === STATUS.INVALID ? STATUS.FAILED : incomingStatus;
 
-  if (existing === STATUS.FLAKY || incoming === STATUS.FLAKY) {
-    return STATUS.FLAKY;
-  }
-
   const passFailCombo =
     (existing === STATUS.PASSED && incoming === STATUS.FAILED) ||
     (existing === STATUS.FAILED && incoming === STATUS.PASSED);
 
   if (passFailCombo) {
-    return STATUS.FLAKY;
+    return STATUS.PASSED;
   }
 
   return statusRank(incoming) < statusRank(existing) ? incomingStatus : existingStatus;
@@ -889,7 +886,7 @@ function countExecutionStatuses(executionStatuses) {
   for (const status of executionStatuses) {
     if (status === STATUS.PASSED) counts.passed++;
     else if (status === STATUS.FAILED) counts.failed++;
-    else if (status === STATUS.FLAKY) counts.flaky++;
+    else if (status === STATUS.FLAKY) counts.passed++;
     else if (status === STATUS.SKIPPED) counts.skipped++;
     else if (status === STATUS.INVALID) counts.invalid++;
     else counts.blocked++;
@@ -943,20 +940,17 @@ function buildSlackMessage({
   const passRate = totalExecutions > 0 ? Math.round((passed / totalExecutions) * 100) : 0;
 
   const hasFailedLike = counts.failed > 0 || counts.invalid > 0 || counts.blocked > 0;
-  const hasFlaky = counts.flaky > 0;
 
   let statusText;
 
   if (hasFailedLike) {
     statusText = '❌ Attention required';
-  } else if (hasFlaky) {
-    statusText = '⚠️ Passed with warnings';
   } else {
     statusText = '✅ Passed';
   }
 
   const importantLines = lines.filter((line) => {
-    return [STATUS.FAILED, STATUS.FLAKY, STATUS.BLOCKED, STATUS.INVALID].includes(line.status);
+    return [STATUS.FAILED, STATUS.BLOCKED, STATUS.INVALID].includes(line.status);
   });
 
   const attentionSummary =
@@ -1088,24 +1082,26 @@ async function processRunCompleted(projectCode, runId) {
           result?.state
       );
 
-      if (status === STATUS.INVALID && inferFailedFromResult(result)) {
+      const isFlaky = inferFlakyFromResult(result);
+
+      if (isFlaky) {
+        status = STATUS.PASSED;
+      } else if (status === STATUS.INVALID && inferFailedFromResult(result)) {
         status = STATUS.FAILED;
       }
 
       if (caseId && caseMap.has(caseId)) {
         const caseStatus = caseMap.get(caseId)?.status;
 
-        if (caseStatus && caseStatus !== STATUS.INVALID) {
+        if (isFlaky) {
+          status = STATUS.PASSED;
+        } else if (caseStatus && caseStatus !== STATUS.INVALID && status !== STATUS.PASSED) {
           status = caseStatus;
         }
 
         if (status === STATUS.INVALID && caseStatus === STATUS.FAILED) {
           status = STATUS.FAILED;
         }
-      }
-
-      if (inferFlakyFromResult(result)) {
-        status = STATUS.FLAKY;
       }
 
       executionStatuses.push(status);
