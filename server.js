@@ -10,6 +10,7 @@
  * - Keeps flaky tests as flaky, not passed and not failed
  * - Does not let runMeta case status overwrite actual result status
  * - Does not let retry text turn an actually failed result into flaky
+ * - Shows failed, blocked, invalid, flaky, and skipped in separate Slack sections
  * - Does not send misleading Slack message when Qase API returns no results
  * - Vercel-safe: waits for processing before returning 200
  */
@@ -21,7 +22,7 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'QASE->SLACK v35 (LATEST UNIQUE CASE STATUS + FLAKY FIX)';
+const VERSION = 'QASE->SLACK v36 (GROUPED ATTENTION SECTIONS)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -474,14 +475,14 @@ function statusEmoji(status) {
   return '⛔';
 }
 
-function statusRank(status) {
-  if (status === STATUS.FAILED) return 0;
-  if (status === STATUS.INVALID) return 1;
-  if (status === STATUS.BLOCKED) return 2;
-  if (status === STATUS.FLAKY) return 3;
-  if (status === STATUS.SKIPPED) return 4;
+function statusLabel(status) {
+  if (status === STATUS.PASSED) return 'passed';
+  if (status === STATUS.FAILED) return 'failed';
+  if (status === STATUS.FLAKY) return 'flaky';
+  if (status === STATUS.SKIPPED) return 'skipped';
+  if (status === STATUS.INVALID) return 'invalid';
 
-  return 5;
+  return 'blocked';
 }
 
 /* ---------------- TITLE HELPERS ---------------- */
@@ -1035,9 +1036,17 @@ async function sendToSlack(payload) {
 function formatLinesForSlack(lines) {
   return lines
     .map((line) => {
-      return `${statusEmoji(line.status)} ${line.title} — *${line.status}*`;
+      return `${statusEmoji(line.status)} ${line.title} — *${statusLabel(line.status)}*`;
     })
     .join('\n');
+}
+
+function formatOptionalSection(title, lines) {
+  if (!lines.length) {
+    return '';
+  }
+
+  return `\n\n*${title}:*\n${formatLinesForSlack(lines)}`;
 }
 
 function buildSlackMessage({
@@ -1052,11 +1061,14 @@ function buildSlackMessage({
   const passRate = totalCases > 0 ? Math.round((passed / totalCases) * 100) : 0;
 
   const failedLines = lines.filter((line) => line.status === STATUS.FAILED);
-  const invalidLines = lines.filter((line) => line.status === STATUS.INVALID);
   const blockedLines = lines.filter((line) => line.status === STATUS.BLOCKED);
+  const invalidLines = lines.filter((line) => line.status === STATUS.INVALID);
   const flakyLines = lines.filter((line) => line.status === STATUS.FLAKY);
+  const skippedLines = lines.filter((line) => line.status === STATUS.SKIPPED);
 
-  const hasFailedLike = failedLines.length > 0 || invalidLines.length > 0 || blockedLines.length > 0;
+  const hasFailedLike =
+    failedLines.length > 0 || blockedLines.length > 0 || invalidLines.length > 0;
+
   const hasFlaky = flakyLines.length > 0;
 
   let statusText;
@@ -1069,17 +1081,16 @@ function buildSlackMessage({
     statusText = '✅ Passed';
   }
 
-  const failedLikeLines = [...failedLines, ...invalidLines, ...blockedLines];
-
   const attentionSummary =
-    failedLikeLines.length > 0
-      ? `*Tests requiring attention:*\n${formatLinesForSlack(failedLikeLines)}`
+    hasFailedLike
+      ? `*Tests requiring attention:*` +
+        formatOptionalSection('Failed tests', failedLines) +
+        formatOptionalSection('Blocked tests', blockedLines) +
+        formatOptionalSection('Invalid tests', invalidLines)
       : 'No failed, blocked, or invalid test cases.';
 
-  const flakySummary =
-    flakyLines.length > 0
-      ? `\n\n*Flaky tests:*\n${formatLinesForSlack(flakyLines)}`
-      : '';
+  const flakySummary = formatOptionalSection('Flaky tests', flakyLines);
+  const skippedSummary = formatOptionalSection('Skipped tests', skippedLines);
 
   const disclaimer =
     'Important: Not all failed or flaky tests indicate a software defect. Some failures can be caused by temporary environment issues, slow response times, network instability, third-party outages, or test runner constraints and may require a rerun to confirm.';
@@ -1108,7 +1119,8 @@ function buildSlackMessage({
     rawExecutionLine +
     `_${disclaimer}_\n\n` +
     attentionSummary +
-    flakySummary
+    flakySummary +
+    skippedSummary
   );
 }
 
@@ -1174,11 +1186,6 @@ async function processRunCompleted(projectCode, runId) {
             ? c.case.title.trim()
             : null;
 
-      /*
-       * Important:
-       * We store runMeta status only for reference if needed in future.
-       * We do NOT use this status to overwrite actual result status.
-       */
       const status = normalizeStatus(c?.status ?? c?.status_id ?? c?.result ?? c?.state);
 
       caseMap.set(caseId, {
