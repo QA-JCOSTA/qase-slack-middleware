@@ -6,7 +6,9 @@
  * - Fetches Qase results directly by run id using ?run=<runId>
  * - Counts unique Qase test cases for Slack totals, not raw executions
  * - Keeps repeated executions grouped into one final status per test case
+ * - Uses the latest result per test case as final status
  * - Keeps flaky tests as flaky, not passed and not failed
+ * - Does not let runMeta case status overwrite actual result status
  * - Does not let retry text turn an actually failed result into flaky
  * - Does not send misleading Slack message when Qase API returns no results
  * - Vercel-safe: waits for processing before returning 200
@@ -19,7 +21,7 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'QASE->SLACK v34 (UNIQUE CASE COUNTS + FLAKY FIX)';
+const VERSION = 'QASE->SLACK v35 (LATEST UNIQUE CASE STATUS + FLAKY FIX)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -837,6 +839,83 @@ function inferFlakyFromResult(result, normalizedStatus) {
   return false;
 }
 
+function getResultFinalStatus(result) {
+  let status = normalizeStatus(
+    result?.status ??
+      result?.status_id ??
+      result?.statusId ??
+      result?.result ??
+      result?.state
+  );
+
+  if (status === STATUS.INVALID && inferFailedFromResult(result)) {
+    status = STATUS.FAILED;
+  }
+
+  const isFlaky = inferFlakyFromResult(result, status);
+
+  if (isFlaky) {
+    status = STATUS.FLAKY;
+  }
+
+  return status;
+}
+
+function getResultTimestamp(result) {
+  const candidates = [
+    result?.end_time,
+    result?.endTime,
+    result?.created_at,
+    result?.createdAt,
+    result?.created,
+    result?.updated_at,
+    result?.updatedAt,
+    result?.time,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined) {
+      continue;
+    }
+
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+      return candidate > 1000000000000 ? candidate : candidate * 1000;
+    }
+
+    if (typeof candidate === 'string' && candidate.trim()) {
+      const parsed = Date.parse(candidate);
+
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+
+      const numeric = Number(candidate);
+
+      if (Number.isFinite(numeric)) {
+        return numeric > 1000000000000 ? numeric : numeric * 1000;
+      }
+    }
+  }
+
+  return 0;
+}
+
+function getResultOrderValue(result, fallbackIndex) {
+  const timestamp = getResultTimestamp(result);
+
+  if (timestamp > 0) {
+    return timestamp;
+  }
+
+  const id = Number(result?.id);
+
+  if (Number.isFinite(id) && id > 0) {
+    return id;
+  }
+
+  return fallbackIndex;
+}
+
 /* ---------------- AGGREGATION ---------------- */
 
 function mergeKeyForResult(result) {
@@ -884,27 +963,16 @@ function pickBetterTitle(currentTitle, incomingTitle) {
     : currentTitle;
 }
 
-function combineStatus(existingStatus, incomingStatus) {
+function combineStatus(existingStatus, incomingStatus, existingOrder = 0, incomingOrder = 0) {
   if (!existingStatus) {
     return incomingStatus;
   }
 
-  const existing = existingStatus === STATUS.INVALID ? STATUS.FAILED : existingStatus;
-  const incoming = incomingStatus === STATUS.INVALID ? STATUS.FAILED : incomingStatus;
-
-  if (existing === STATUS.FLAKY || incoming === STATUS.FLAKY) {
-    return STATUS.FLAKY;
+  if (incomingOrder >= existingOrder) {
+    return incomingStatus;
   }
 
-  const passFailCombo =
-    (existing === STATUS.PASSED && incoming === STATUS.FAILED) ||
-    (existing === STATUS.FAILED && incoming === STATUS.PASSED);
-
-  if (passFailCombo) {
-    return STATUS.FLAKY;
-  }
-
-  return statusRank(incoming) < statusRank(existing) ? incomingStatus : existingStatus;
+  return existingStatus;
 }
 
 function countUniqueCaseStatuses(lines) {
@@ -1034,7 +1102,8 @@ function buildSlackMessage({
     `❌ Failed: *${counts.failed}*\n` +
     `⚠️ Flaky: *${counts.flaky}*\n` +
     `↪️ Skipped: *${counts.skipped}*\n` +
-    `⛔ Blocked: *${counts.blocked}*\n\n` +
+    `⛔ Blocked: *${counts.blocked}*\n` +
+    `❓ Invalid: *${counts.invalid}*\n\n` +
     `Total unique Qase test cases: *${totalCases}*\n` +
     rawExecutionLine +
     `_${disclaimer}_\n\n` +
@@ -1105,6 +1174,11 @@ async function processRunCompleted(projectCode, runId) {
             ? c.case.title.trim()
             : null;
 
+      /*
+       * Important:
+       * We store runMeta status only for reference if needed in future.
+       * We do NOT use this status to overwrite actual result status.
+       */
       const status = normalizeStatus(c?.status ?? c?.status_id ?? c?.result ?? c?.state);
 
       caseMap.set(caseId, {
@@ -1128,40 +1202,12 @@ async function processRunCompleted(projectCode, runId) {
 
     const aggregated = new Map();
 
-    for (const result of results) {
+    for (let index = 0; index < results.length; index++) {
+      const result = results[index];
       const caseId = extractCaseId(result);
 
-      let status = normalizeStatus(
-        result?.status ??
-          result?.status_id ??
-          result?.statusId ??
-          result?.result ??
-          result?.state
-      );
-
-      if (status === STATUS.INVALID && inferFailedFromResult(result)) {
-        status = STATUS.FAILED;
-      }
-
-      const isFlaky = inferFlakyFromResult(result, status);
-
-      if (isFlaky) {
-        status = STATUS.FLAKY;
-      }
-
-      if (caseId && caseMap.has(caseId)) {
-        const caseStatus = caseMap.get(caseId)?.status;
-
-        if (status === STATUS.FLAKY || caseStatus === STATUS.FLAKY) {
-          status = STATUS.FLAKY;
-        } else if (caseStatus && caseStatus !== STATUS.INVALID && status !== STATUS.PASSED) {
-          status = caseStatus;
-        }
-
-        if (status === STATUS.INVALID && caseStatus === STATUS.FAILED) {
-          status = STATUS.FAILED;
-        }
-      }
+      const status = getResultFinalStatus(result);
+      const resultOrder = getResultOrderValue(result, index);
 
       let title;
 
@@ -1190,12 +1236,14 @@ async function processRunCompleted(projectCode, runId) {
           title: titleWithSuffix,
           status,
           caseId,
+          order: resultOrder,
         });
       } else {
         aggregated.set(key, {
           title: pickBetterTitle(existing.title, titleWithSuffix),
-          status: combineStatus(existing.status, status),
+          status: combineStatus(existing.status, status, existing.order, resultOrder),
           caseId: existing.caseId || caseId,
+          order: Math.max(existing.order || 0, resultOrder || 0),
         });
       }
     }
