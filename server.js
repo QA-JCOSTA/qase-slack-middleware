@@ -4,11 +4,12 @@
  *
  * Fixes:
  * - Fetches Qase results directly by run id using ?run=<runId>
- * - Counts raw test executions for Slack result totals
- * - Keeps attention list grouped by unique test case
+ * - Counts unique Qase test cases for Slack totals, not raw executions
+ * - Keeps repeated executions grouped into one final status per test case
+ * - Keeps flaky tests as flaky, not passed and not failed
+ * - Does not let retry text turn an actually failed result into flaky
  * - Does not send misleading Slack message when Qase API returns no results
  * - Vercel-safe: waits for processing before returning 200
- * - Keeps flaky tests as flaky, not passed and not failed
  */
 
 require('dotenv').config();
@@ -18,7 +19,7 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'QASE->SLACK v33 (FLAKY STAYS FLAKY)';
+const VERSION = 'QASE->SLACK v34 (UNIQUE CASE COUNTS + FLAKY FIX)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -351,7 +352,7 @@ async function fetchResultsForRunStrict(runId, _startedAtUnix, options = {}) {
         unique.push(result);
       }
 
-      log(`[QASE] Results for run ${runId}: ${unique.length} found.`);
+      log(`[QASE] Results for run ${runId}: ${unique.length} result executions found.`);
 
       return unique;
     }
@@ -747,7 +748,52 @@ function inferFailedFromResult(result) {
   return Boolean(hasErrorWord || hasAssertion || hasAttachments);
 }
 
-function inferFlakyFromResult(result) {
+function extractAttemptStatuses(result) {
+  const attempts =
+    (Array.isArray(result?.retry_results) && result.retry_results) ||
+    (Array.isArray(result?.attempts) && result.attempts) ||
+    (Array.isArray(result?.results) && result.results) ||
+    [];
+
+  return attempts
+    .map((attempt) => {
+      return normalizeStatus(
+        attempt?.status ??
+          attempt?.status_id ??
+          attempt?.statusId ??
+          attempt?.result ??
+          attempt?.state
+      );
+    })
+    .filter(Boolean);
+}
+
+function hasRetrySignal(result) {
+  const retryCount =
+    Number(result?.retry) ||
+    Number(result?.retry_count) ||
+    Number(result?.retest) ||
+    Number(result?.retest_count) ||
+    0;
+
+  if (retryCount > 0) {
+    return true;
+  }
+
+  if (Array.isArray(result?.retries) && result.retries.length > 0) {
+    return true;
+  }
+
+  const comment = typeof result?.comment === 'string' ? result.comment : '';
+  const stack = typeof result?.stacktrace === 'string' ? result.stacktrace : '';
+
+  return (
+    /passed after retry|pass(?:ed)? on retry|retry passed|flaky|unstable/i.test(comment) ||
+    /passed after retry|pass(?:ed)? on retry|retry passed|flaky|unstable/i.test(stack)
+  );
+}
+
+function inferFlakyFromResult(result, normalizedStatus) {
   if (!result || typeof result !== 'object') {
     return false;
   }
@@ -767,53 +813,24 @@ function inferFlakyFromResult(result) {
     return true;
   }
 
-  const retryCount =
-    Number(result.retries) ||
-    Number(result.retry) ||
-    Number(result.retry_count) ||
-    Number(result.retest) ||
-    Number(result.retest_count) ||
-    0;
+  const attemptStatuses = extractAttemptStatuses(result);
 
-  const attempts =
-    (Array.isArray(result.retries) && result.retries) ||
-    (Array.isArray(result.retry_results) && result.retry_results) ||
-    (Array.isArray(result.attempts) && result.attempts) ||
-    (Array.isArray(result.results) && result.results) ||
-    [];
-
-  if (attempts.length) {
-    const statuses = attempts
-      .map((attempt) => {
-        return normalizeStatus(
-          attempt?.status ??
-            attempt?.status_id ??
-            attempt?.statusId ??
-            attempt?.result ??
-            attempt?.state
-        );
-      })
-      .filter(Boolean);
-
-    const hasFail = statuses.includes(STATUS.FAILED) || statuses.includes(STATUS.INVALID);
-    const hasPass = statuses.includes(STATUS.PASSED);
+  if (attemptStatuses.length) {
+    const hasFail =
+      attemptStatuses.includes(STATUS.FAILED) || attemptStatuses.includes(STATUS.INVALID);
+    const hasPass = attemptStatuses.includes(STATUS.PASSED);
 
     if (hasFail && hasPass) {
       return true;
     }
   }
 
-  if (retryCount > 0) {
-    return true;
-  }
-
-  const comment = typeof result.comment === 'string' ? result.comment : '';
-  const stack = typeof result.stacktrace === 'string' ? result.stacktrace : '';
-
-  if (
-    /retry|re-?run|rerun|flaky/i.test(comment) ||
-    /retry|re-?run|rerun|flaky/i.test(stack)
-  ) {
+  /*
+   * Important:
+   * A failed result that merely mentions "retry" must remain failed.
+   * Only a PASSED final result with retry/flaky signal is considered flaky.
+   */
+  if (normalizedStatus === STATUS.PASSED && hasRetrySignal(result)) {
     return true;
   }
 
@@ -890,7 +907,7 @@ function combineStatus(existingStatus, incomingStatus) {
   return statusRank(incoming) < statusRank(existing) ? incomingStatus : existingStatus;
 }
 
-function countExecutionStatuses(executionStatuses) {
+function countUniqueCaseStatuses(lines) {
   const counts = {
     passed: 0,
     failed: 0,
@@ -900,7 +917,9 @@ function countExecutionStatuses(executionStatuses) {
     invalid: 0,
   };
 
-  for (const status of executionStatuses) {
+  for (const line of lines) {
+    const status = line.status;
+
     if (status === STATUS.PASSED) counts.passed++;
     else if (status === STATUS.FAILED) counts.failed++;
     else if (status === STATUS.FLAKY) counts.flaky++;
@@ -945,19 +964,32 @@ async function sendToSlack(payload) {
   }
 }
 
+function formatLinesForSlack(lines) {
+  return lines
+    .map((line) => {
+      return `${statusEmoji(line.status)} ${line.title} — *${line.status}*`;
+    })
+    .join('\n');
+}
+
 function buildSlackMessage({
   projectCode,
   reportLink,
   counts,
-  totalExecutions,
-  uniqueCaseCount,
+  totalCases,
+  totalRawExecutions,
   lines,
 }) {
   const passed = counts.passed;
-  const passRate = totalExecutions > 0 ? Math.round((passed / totalExecutions) * 100) : 0;
+  const passRate = totalCases > 0 ? Math.round((passed / totalCases) * 100) : 0;
 
-  const hasFailedLike = counts.failed > 0 || counts.invalid > 0 || counts.blocked > 0;
-  const hasFlaky = counts.flaky > 0;
+  const failedLines = lines.filter((line) => line.status === STATUS.FAILED);
+  const invalidLines = lines.filter((line) => line.status === STATUS.INVALID);
+  const blockedLines = lines.filter((line) => line.status === STATUS.BLOCKED);
+  const flakyLines = lines.filter((line) => line.status === STATUS.FLAKY);
+
+  const hasFailedLike = failedLines.length > 0 || invalidLines.length > 0 || blockedLines.length > 0;
+  const hasFlaky = flakyLines.length > 0;
 
   let statusText;
 
@@ -969,34 +1001,25 @@ function buildSlackMessage({
     statusText = '✅ Passed';
   }
 
-  const importantLines = lines.filter((line) => {
-    return [STATUS.FAILED, STATUS.BLOCKED, STATUS.INVALID].includes(line.status);
-  });
-
-  const flakyLines = lines.filter((line) => {
-    return line.status === STATUS.FLAKY;
-  });
+  const failedLikeLines = [...failedLines, ...invalidLines, ...blockedLines];
 
   const attentionSummary =
-    importantLines.length > 0
-      ? `*Tests requiring attention:*\n${importantLines
-          .map((line) => {
-            return `${statusEmoji(line.status)} ${line.title} — *${line.status}*`;
-          })
-          .join('\n')}`
-      : 'No failed, blocked, or invalid test executions.';
+    failedLikeLines.length > 0
+      ? `*Tests requiring attention:*\n${formatLinesForSlack(failedLikeLines)}`
+      : 'No failed, blocked, or invalid test cases.';
 
   const flakySummary =
     flakyLines.length > 0
-      ? `\n\n*Flaky tests:*\n${flakyLines
-          .map((line) => {
-            return `${statusEmoji(line.status)} ${line.title} — *${line.status}*`;
-          })
-          .join('\n')}`
+      ? `\n\n*Flaky tests:*\n${formatLinesForSlack(flakyLines)}`
       : '';
 
   const disclaimer =
     'Important: Not all failed or flaky tests indicate a software defect. Some failures can be caused by temporary environment issues, slow response times, network instability, third-party outages, or test runner constraints and may require a rerun to confirm.';
+
+  const rawExecutionLine =
+    totalRawExecutions && totalRawExecutions !== totalCases
+      ? `Raw Qase result executions fetched: *${totalRawExecutions}* — grouped into *${totalCases}* unique test cases.\n\n`
+      : '';
 
   return (
     `*Automation Regression Tests*\n\n` +
@@ -1005,14 +1028,15 @@ function buildSlackMessage({
     `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
     `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
     `*Status:* ${statusText}\n` +
-    `*Result:* ${passed}/${totalExecutions} test executions passed — ${passRate}%\n\n` +
+    `*Result:* ${passed}/${totalCases} unique test cases passed — ${passRate}%\n\n` +
     `*Test status overview:*\n` +
     `✅ Passed: *${counts.passed}*\n` +
     `❌ Failed: *${counts.failed}*\n` +
     `⚠️ Flaky: *${counts.flaky}*\n` +
     `↪️ Skipped: *${counts.skipped}*\n` +
     `⛔ Blocked: *${counts.blocked}*\n\n` +
-    `Unique Qase test cases grouped for attention: *${uniqueCaseCount}*\n\n` +
+    `Total unique Qase test cases: *${totalCases}*\n` +
+    rawExecutionLine +
     `_${disclaimer}_\n\n` +
     attentionSummary +
     flakySummary
@@ -1068,7 +1092,7 @@ async function processRunCompleted(projectCode, runId) {
     const caseMap = new Map();
 
     for (const c of runCases) {
-      const caseId = Number(c?.case_id ?? c?.id ?? c?.case?.id);
+      const caseId = Number(c?.case_id ?? c?.id ?? c?.case?.id ?? c);
 
       if (!Number.isFinite(caseId) || caseId <= 0) {
         continue;
@@ -1103,7 +1127,6 @@ async function processRunCompleted(projectCode, runId) {
     }
 
     const aggregated = new Map();
-    const executionStatuses = [];
 
     for (const result of results) {
       const caseId = extractCaseId(result);
@@ -1116,18 +1139,20 @@ async function processRunCompleted(projectCode, runId) {
           result?.state
       );
 
-      const isFlaky = inferFlakyFromResult(result);
+      if (status === STATUS.INVALID && inferFailedFromResult(result)) {
+        status = STATUS.FAILED;
+      }
+
+      const isFlaky = inferFlakyFromResult(result, status);
 
       if (isFlaky) {
         status = STATUS.FLAKY;
-      } else if (status === STATUS.INVALID && inferFailedFromResult(result)) {
-        status = STATUS.FAILED;
       }
 
       if (caseId && caseMap.has(caseId)) {
         const caseStatus = caseMap.get(caseId)?.status;
 
-        if (isFlaky || status === STATUS.FLAKY || caseStatus === STATUS.FLAKY) {
+        if (status === STATUS.FLAKY || caseStatus === STATUS.FLAKY) {
           status = STATUS.FLAKY;
         } else if (caseStatus && caseStatus !== STATUS.INVALID && status !== STATUS.PASSED) {
           status = caseStatus;
@@ -1137,8 +1162,6 @@ async function processRunCompleted(projectCode, runId) {
           status = STATUS.FAILED;
         }
       }
-
-      executionStatuses.push(status);
 
       let title;
 
@@ -1166,11 +1189,13 @@ async function processRunCompleted(projectCode, runId) {
         aggregated.set(key, {
           title: titleWithSuffix,
           status,
+          caseId,
         });
       } else {
         aggregated.set(key, {
           title: pickBetterTitle(existing.title, titleWithSuffix),
           status: combineStatus(existing.status, status),
+          caseId: existing.caseId || caseId,
         });
       }
     }
@@ -1190,20 +1215,20 @@ async function processRunCompleted(projectCode, runId) {
       return (order[a.status] ?? 9) - (order[b.status] ?? 9);
     });
 
-    const counts = countExecutionStatuses(executionStatuses);
-    const totalExecutions = getCountsTotal(counts);
-    const uniqueCaseCount = lines.length;
+    const counts = countUniqueCaseStatuses(lines);
+    const totalCases = getCountsTotal(counts);
+    const totalRawExecutions = results.length;
 
     log(
-      `[QASE] Run ${runId} summary: executions=${totalExecutions}, uniqueCases=${uniqueCaseCount}, passed=${counts.passed}, failed=${counts.failed}, flaky=${counts.flaky}, skipped=${counts.skipped}, blocked=${counts.blocked}, invalid=${counts.invalid}`
+      `[QASE] Run ${runId} summary: rawExecutions=${totalRawExecutions}, uniqueCases=${totalCases}, passed=${counts.passed}, failed=${counts.failed}, flaky=${counts.flaky}, skipped=${counts.skipped}, blocked=${counts.blocked}, invalid=${counts.invalid}`
     );
 
     const slackText = buildSlackMessage({
       projectCode,
       reportLink: qaseReportLink,
       counts,
-      totalExecutions,
-      uniqueCaseCount,
+      totalCases,
+      totalRawExecutions,
       lines,
     });
 
@@ -1212,7 +1237,7 @@ async function processRunCompleted(projectCode, runId) {
     });
 
     log(
-      `[DONE] Run ${runId} processed. executions=${totalExecutions}, uniqueCases=${uniqueCaseCount}`
+      `[DONE] Run ${runId} processed. rawExecutions=${totalRawExecutions}, uniqueCases=${totalCases}`
     );
   })();
 
