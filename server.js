@@ -1095,10 +1095,7 @@ function buildSlackMessage({
   const disclaimer =
     'Important: Not all failed or flaky tests indicate a software defect. Some failures can be caused by temporary environment issues, slow response times, network instability, third-party outages, or test runner constraints and may require a rerun to confirm.';
 
-  const rawExecutionLine =
-    totalRawExecutions && totalRawExecutions !== totalCases
-      ? `Raw Qase result executions fetched: *${totalRawExecutions}* — grouped into *${totalCases}* unique test cases.\n\n`
-      : '';
+  
 
   return (
     `*Automation Regression Tests*\n\n` +
@@ -1116,7 +1113,7 @@ function buildSlackMessage({
     `⛔ Blocked: *${counts.blocked}*\n` +
     `❓ Invalid: *${counts.invalid}*\n\n` +
     `Total unique Qase test cases: *${totalCases}*\n` +
-    rawExecutionLine +
+    
     `_${disclaimer}_\n\n` +
     attentionSummary +
     flakySummary +
