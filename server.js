@@ -8,7 +8,7 @@
  * - Keeps attention list grouped by unique test case
  * - Does not send misleading Slack message when Qase API returns no results
  * - Vercel-safe: waits for processing before returning 200
- * - Treats flaky tests as passed
+ * - Keeps flaky tests as flaky, not passed and not failed
  */
 
 require('dotenv').config();
@@ -18,7 +18,7 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'QASE->SLACK v32 (FLAKY COUNTS AS PASSED)';
+const VERSION = 'QASE->SLACK v33 (FLAKY STAYS FLAKY)';
 
 const REQUIRED_ENVS = ['SLACK_WEBHOOK_URL', 'QASE_API_TOKEN', 'QASE_PROJECT_CODE'];
 
@@ -424,7 +424,7 @@ function normalizeStatus(raw) {
     if (raw === 3) return STATUS.BLOCKED;
     if (raw === 4) return STATUS.SKIPPED;
     if (raw === 5) return STATUS.INVALID;
-    if (raw === 6) return STATUS.PASSED;
+    if (raw === 6) return STATUS.FLAKY;
 
     return STATUS.BLOCKED;
   }
@@ -433,7 +433,8 @@ function normalizeStatus(raw) {
 
   if (status === 'passed' || status === 'pass') return STATUS.PASSED;
   if (status === 'failed' || status === 'fail') return STATUS.FAILED;
-  if (status === 'flaky' || status === 'unstable') return STATUS.PASSED;
+  if (status === 'flaky' || status === 'unstable') return STATUS.FLAKY;
+
   if (
     status === 'skipped' ||
     status === 'skiped' ||
@@ -442,6 +443,7 @@ function normalizeStatus(raw) {
   ) {
     return STATUS.SKIPPED;
   }
+
   if (status === 'invalid') return STATUS.INVALID;
 
   if (
@@ -754,6 +756,17 @@ function inferFlakyFromResult(result) {
     return true;
   }
 
+  const rawStatus =
+    result?.status ??
+    result?.status_id ??
+    result?.statusId ??
+    result?.result ??
+    result?.state;
+
+  if (normalizeStatus(rawStatus) === STATUS.FLAKY) {
+    return true;
+  }
+
   const retryCount =
     Number(result.retries) ||
     Number(result.retry) ||
@@ -862,12 +875,16 @@ function combineStatus(existingStatus, incomingStatus) {
   const existing = existingStatus === STATUS.INVALID ? STATUS.FAILED : existingStatus;
   const incoming = incomingStatus === STATUS.INVALID ? STATUS.FAILED : incomingStatus;
 
+  if (existing === STATUS.FLAKY || incoming === STATUS.FLAKY) {
+    return STATUS.FLAKY;
+  }
+
   const passFailCombo =
     (existing === STATUS.PASSED && incoming === STATUS.FAILED) ||
     (existing === STATUS.FAILED && incoming === STATUS.PASSED);
 
   if (passFailCombo) {
-    return STATUS.PASSED;
+    return STATUS.FLAKY;
   }
 
   return statusRank(incoming) < statusRank(existing) ? incomingStatus : existingStatus;
@@ -886,7 +903,7 @@ function countExecutionStatuses(executionStatuses) {
   for (const status of executionStatuses) {
     if (status === STATUS.PASSED) counts.passed++;
     else if (status === STATUS.FAILED) counts.failed++;
-    else if (status === STATUS.FLAKY) counts.passed++;
+    else if (status === STATUS.FLAKY) counts.flaky++;
     else if (status === STATUS.SKIPPED) counts.skipped++;
     else if (status === STATUS.INVALID) counts.invalid++;
     else counts.blocked++;
@@ -940,17 +957,24 @@ function buildSlackMessage({
   const passRate = totalExecutions > 0 ? Math.round((passed / totalExecutions) * 100) : 0;
 
   const hasFailedLike = counts.failed > 0 || counts.invalid > 0 || counts.blocked > 0;
+  const hasFlaky = counts.flaky > 0;
 
   let statusText;
 
   if (hasFailedLike) {
     statusText = '❌ Attention required';
+  } else if (hasFlaky) {
+    statusText = '⚠️ Passed with flaky tests';
   } else {
     statusText = '✅ Passed';
   }
 
   const importantLines = lines.filter((line) => {
     return [STATUS.FAILED, STATUS.BLOCKED, STATUS.INVALID].includes(line.status);
+  });
+
+  const flakyLines = lines.filter((line) => {
+    return line.status === STATUS.FLAKY;
   });
 
   const attentionSummary =
@@ -960,10 +984,19 @@ function buildSlackMessage({
             return `${statusEmoji(line.status)} ${line.title} — *${line.status}*`;
           })
           .join('\n')}`
-      : 'All test executions passed successfully.';
+      : 'No failed, blocked, or invalid test executions.';
+
+  const flakySummary =
+    flakyLines.length > 0
+      ? `\n\n*Flaky tests:*\n${flakyLines
+          .map((line) => {
+            return `${statusEmoji(line.status)} ${line.title} — *${line.status}*`;
+          })
+          .join('\n')}`
+      : '';
 
   const disclaimer =
-    'Important: Not all failed tests indicate a software defect. Some failures can be caused by temporary environment issues, slow response times, network instability, third-party outages, or test runner constraints and may require a rerun to confirm.';
+    'Important: Not all failed or flaky tests indicate a software defect. Some failures can be caused by temporary environment issues, slow response times, network instability, third-party outages, or test runner constraints and may require a rerun to confirm.';
 
   return (
     `*Automation Regression Tests*\n\n` +
@@ -981,7 +1014,8 @@ function buildSlackMessage({
     `⛔ Blocked: *${counts.blocked}*\n\n` +
     `Unique Qase test cases grouped for attention: *${uniqueCaseCount}*\n\n` +
     `_${disclaimer}_\n\n` +
-    attentionSummary
+    attentionSummary +
+    flakySummary
   );
 }
 
@@ -1085,7 +1119,7 @@ async function processRunCompleted(projectCode, runId) {
       const isFlaky = inferFlakyFromResult(result);
 
       if (isFlaky) {
-        status = STATUS.PASSED;
+        status = STATUS.FLAKY;
       } else if (status === STATUS.INVALID && inferFailedFromResult(result)) {
         status = STATUS.FAILED;
       }
@@ -1093,8 +1127,8 @@ async function processRunCompleted(projectCode, runId) {
       if (caseId && caseMap.has(caseId)) {
         const caseStatus = caseMap.get(caseId)?.status;
 
-        if (isFlaky) {
-          status = STATUS.PASSED;
+        if (isFlaky || status === STATUS.FLAKY || caseStatus === STATUS.FLAKY) {
+          status = STATUS.FLAKY;
         } else if (caseStatus && caseStatus !== STATUS.INVALID && status !== STATUS.PASSED) {
           status = caseStatus;
         }
