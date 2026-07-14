@@ -1102,7 +1102,7 @@ function buildSlackMessage({
     formatReportLine(reportLink) +
     `Project: *${projectCode}*\n` +
     `Date: *${formatRunDateDenmarkWithWeek()}*\n` +
-    `Browsers: Chrome, Edge, Firefox, Safari, Mobile(webkit)\n\n` +
+    `Browsers: Chrome, Safari, Mobile(webkit)\n\n` +
     `*Status:* ${statusText}\n` +
     `*Result:* ${passed}/${totalCases} unique test cases passed — ${passRate}%\n\n` +
     `*Test status overview:*\n` +
